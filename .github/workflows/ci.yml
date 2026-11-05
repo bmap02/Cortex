@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D clippy::correctness
+      - run: cargo test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: End-to-end against the mock server
+        shell: bash
+        env:
+          CORTEX_HOME: ${{ runner.temp }}/cortex-home
+        run: |
+          python tests/mock_server.py 11999 &
+          sleep 2
+          cargo build
+          BIN=target/debug/cortex
+          $BIN config set base_url http://127.0.0.1:11999
+          $BIN config set model mock:7b
+          $BIN doctor
+          out=$($BIN run -q "what is 1234 * 5678?" < /dev/null)
+          echo "$out"
+          echo "$out" | grep -q 7006652
+          $BIN config set backend openai
+          $BIN config set base_url http://127.0.0.1:11999/v1
+          $BIN config set model mock-7b
+          out=$($BIN run -q "what is 1234 * 5678?" < /dev/null)
+          echo "$out" | grep -q 7006652

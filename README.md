@@ -1,0 +1,276 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-banner-dark.svg">
+  <img alt="Cortex" src="assets/readme-banner-light.svg">
+</picture>
+
+A lightweight AI agent for your terminal that runs entirely on your machine, on
+Windows, macOS and Linux. It is a single ~5 MB Rust binary with no telemetry, and it talks to **Ollama** or
+**any OpenAI-compatible server** (llama.cpp, LM Studio, vLLM, LocalAI, Jan).
+
+- **Streaming chat** with history, multi-line input and Tab-completed `/commands`
+- **Agent tools**: read, write, patch, list and search files; run shell commands and Python;
+  exact math; long-term memory
+- **Approval before changes**: shell commands, Python and file writes ask y/n/always first
+- **Cross-platform**: PowerShell on Windows, `sh` on macOS/Linux, colors in every modern terminal
+- **Sessions** are saved automatically and can be resumed with `cortex -r`
+- **Context management**: `/compress`, plus automatic compression when the context is ~85% full
+- **One-shot and pipe mode**: `git diff | cortex run -q "write a commit message"`
+- **Offline by default**: the `fetch_url` web tool stays off until you enable it
+
+## Installation
+
+Cortex runs on **Windows 10/11, macOS and Linux**. You need two things: a model server
+(the program that actually runs the AI) and the `cortex` binary.
+
+### Step 1: Install a model server
+
+The easiest option is **Ollama**:
+
+| OS | Command |
+|---|---|
+| Windows | `winget install Ollama.Ollama` (or the installer from [ollama.com/download](https://ollama.com/download)) |
+| macOS | `brew install ollama` (or the app from [ollama.com/download](https://ollama.com/download)) |
+| Linux | `curl -fsSL https://ollama.com/install.sh \| sh` |
+
+Then download a model that supports tool calling:
+
+```bash
+ollama pull qwen2.5:7b        # ~4.7 GB; good all-rounder for 8 GB+ of VRAM
+ollama pull qwen2.5:3b        # smaller, for laptops
+```
+
+You can use **LM Studio**, **llama.cpp**, **vLLM**, **LocalAI** or **Jan** instead; Cortex
+speaks their OpenAI-compatible API too.
+
+### Step 2: Install Cortex
+
+#### Windows: all-in-one installer (from the source folder)
+
+Unzip the source, open the `cortex` folder and **double-click `install-windows.cmd`**. It installs
+anything that's missing and sets everything up:
+
+1. Microsoft C++ Build Tools (Rust needs them on Windows; Windows asks for admin permission)
+2. Rust
+3. Cortex itself (`cortex.exe` goes on your PATH)
+4. Ollama, and starts its server
+5. A model: it suggests one based on your RAM, or lets you pick one you already have
+6. Cortex's config, then runs `cortex doctor`
+
+Running it again is safe: finished steps are skipped. From PowerShell you can also run
+`powershell -ExecutionPolicy Bypass -File .\install-windows.ps1 -Model qwen2.5:7b`.
+
+#### Windows: prebuilt download (once a release is published)
+
+```powershell
+irm https://raw.githubusercontent.com/bmap02/Cortex/main/install.ps1 | iex
+```
+
+This downloads `cortex.exe` to `%LOCALAPPDATA%\Programs\cortex` and adds that folder to your
+PATH (no admin rights needed). **Open a new terminal** afterwards so the PATH change applies.
+
+#### macOS / Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bmap02/Cortex/main/install.sh | sh
+```
+
+This installs to `~/.local/bin/cortex`. If that folder isn't on your PATH, the script prints the
+line to add to your shell config.
+
+Both scripts accept `CORTEX_VERSION=v0.1.0` to pin a version and `CORTEX_INSTALL_DIR` to change
+the location.
+
+#### Manual download
+
+Grab the archive for your system from the [Releases page](https://github.com/bmap02/Cortex/releases),
+unzip it and put `cortex` (or `cortex.exe`) somewhere on your PATH.
+
+| System | File |
+|---|---|
+| Windows (x64, also runs on ARM) | `cortex-x86_64-pc-windows-msvc.zip` |
+| macOS Apple Silicon | `cortex-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `cortex-x86_64-apple-darwin.tar.gz` |
+| Linux x64 | `cortex-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `cortex-aarch64-unknown-linux-gnu.tar.gz` |
+
+#### Build from source
+
+1. Install Rust from [rustup.rs](https://rustup.rs). On Windows, run `rustup-init.exe` and accept
+   its offer to install the Visual Studio C++ build tools (or run `winget install Rustlang.Rustup`).
+2. Build and install:
+
+```bash
+cargo install --git https://github.com/bmap02/Cortex
+# or, from a clone of this repo:
+cargo install --path .
+```
+
+`cargo install` puts the binary in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows), which
+rustup already added to your PATH.
+
+### Step 3: Connect and check
+
+```bash
+cortex setup     # choose Ollama or OpenAI-compatible, the URL and a model
+cortex doctor    # checks the server, the model, tool calling, the shell and Python
+cortex           # start chatting
+```
+
+### Windows notes
+
+- **The banner** needs a window at least 96 columns wide; narrower windows get a one-line header.
+  Set `CORTEX_ASCII=1` to always use the one-line header.
+- **Shell commands** run in PowerShell 7 (`pwsh`) if it's installed, otherwise Windows PowerShell.
+  Cortex tells the model which shell it has, so it writes PowerShell rather than bash.
+- **The `run_python` tool** needs Python: `winget install Python.Python.3.12`. The fake "python"
+  that opens the Microsoft Store doesn't count; Cortex skips it and uses the `py` launcher.
+- **Settings** live in `%USERPROFILE%\.cortex\`.
+- **SmartScreen**: the binaries aren't code-signed, so if you download `cortex.exe` by hand Windows
+  may warn on first run. Choose **More info → Run anyway**. The install script removes this flag
+  for you.
+
+### Updating and uninstalling
+
+Run the install command again to update. To uninstall, delete the binary and the settings folder:
+
+```powershell
+# Windows
+Remove-Item "$env:LOCALAPPDATA\Programs\cortex" -Recurse; Remove-Item "$env:USERPROFILE\.cortex" -Recurse
+```
+
+```bash
+# macOS / Linux
+rm ~/.local/bin/cortex && rm -rf ~/.cortex
+```
+
+### Publishing a release (maintainers)
+
+Binaries are built by GitHub Actions. Push a version tag and the Release workflow builds every
+platform and attaches the archives and `SHA256SUMS.txt` to a new GitHub Release:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The install scripts download from the latest release, so they work once the first tag has
+been published.
+
+## Model servers
+
+```bash
+cortex setup
+```
+
+Choose **1) Ollama** or **2) OpenAI-compatible**, enter the URL and pick a model. Cortex tests the
+connection and lists the models on the server. On an empty Ollama install it offers to download one.
+
+| Server | URL |
+|---|---|
+| Ollama | `http://localhost:11434` |
+| LM Studio | `http://localhost:1234/v1` |
+| llama.cpp `llama-server` | `http://localhost:8080/v1` |
+| vLLM | `http://localhost:8000/v1` |
+
+`cortex doctor` checks the server, the model and tool calling.
+
+**Pick a model that supports tool calling** for agent features, e.g. `qwen2.5` / `qwen3`,
+`llama3.1`+, `mistral-nemo` or `granite3.x`. Models without tool support still work as plain chat;
+Cortex detects this and switches automatically. For llama.cpp, start the server with `--jinja` so
+tool calls work.
+
+## Usage
+
+```bash
+cortex                          # interactive chat (default)
+cortex -m qwen2.5:7b            # use a different model for this run
+cortex --ctx 32k                # bigger context window for this run
+cortex -r                       # resume the latest session (or: cortex -r <id>)
+cortex run "what's in this repo?"
+cat error.log | cortex run -q "what went wrong?"
+cortex models                   # list models on the server
+cortex models pull qwen2.5:7b   # download (Ollama)
+cortex model qwen2.5:7b         # set the default model
+cortex tools                    # list tools; cortex tools disable run_shell
+cortex config                   # show settings; cortex config set num_ctx 16384
+cortex sessions                 # list saved sessions
+cortex sessions delete <id>     # remove one
+cortex sessions clear           # remove all (asks first; -y to skip)
+```
+
+In `run` mode with piped input, nobody is at the keyboard to approve changes, so the tools that
+ask first stay off unless `auto_approve = true`.
+
+### Context window
+
+The context window is how much of the conversation the model can see at once. The default is
+8k tokens. Raise it with `/context 32k` in a chat (saved as your default), `cortex config set num_ctx 32k`,
+or `cortex --ctx 32k` for a single run. `/context` on its own shows the current size and the model's
+maximum. Bigger windows use more GPU memory; if replies suddenly get much slower, the model has spilled
+into system RAM, so step back down. With an OpenAI-compatible server, the server's own limit
+(llama.cpp `-c`, LM Studio's context slider) still applies.
+
+### In-chat commands
+
+| | |
+|---|---|
+| `/model [name]` | show or switch the model |
+| `/models` `/tools` | list models / tools |
+| `/new` | fresh conversation |
+| `/retry` `/undo` | regenerate / drop the last exchange |
+| `/compress` | summarize the conversation to free context |
+| `/usage` | token counts and context fill |
+| `/context [size]` | show or change the context window, e.g. `/context 32k` (saved as default) |
+| `/memory` `/forget` | show / clear long-term memory |
+| `/sessions` `/resume <id>` | saved conversations |
+| `/sessions clear` `/sessions delete <id>` | remove all / one saved session |
+| `/yolo` | toggle auto-approve |
+| `/system` | show the system prompt |
+
+Ctrl+C stops a reply or a running command. End a line with `\` to keep typing on the next line.
+
+## Files
+
+Everything lives in `~/.cortex/` (`%USERPROFILE%\.cortex\` on Windows; override with `CORTEX_HOME`):
+
+| | |
+|---|---|
+| `config.toml` | settings (see below) |
+| `MEMORY.md` | facts the agent saved with `remember`; edit freely |
+| `SOUL.md` | optional persona or extra instructions added to every chat |
+| `sessions/` | saved conversations (JSON) |
+| `history.txt` | your input history |
+
+```toml
+backend = "ollama"            # or "openai"
+base_url = "http://localhost:11434"
+model = "qwen2.5:7b"
+api_key_env = ""              # name of an env var with a key, if your server needs one
+num_ctx = 8192                # context window; also /context 32k or `cortex --ctx 32k` for one run
+temperature = 0.7
+max_steps = 12                # tool rounds per message
+auto_approve = false
+allow_network = false         # enables fetch_url
+show_banner = true
+disabled_tools = []
+```
+
+## Project layout
+
+```
+src/main.rs      CLI, interactive loop, slash commands, setup & doctor
+src/agent.rs     agent loop, sessions, memory, compression
+src/backend.rs   Ollama + OpenAI-compatible streaming clients
+src/tools.rs     tool schemas and implementations
+src/calc.rs      calculator
+src/ui.rs        banner, colors, status line
+tests/mock_server.py   fake Ollama/OpenAI server for testing without a model
+install.sh / install.ps1   one-line installers (download a release)
+install-windows.cmd/.ps1   all-in-one Windows installer (builds from source)
+.github/workflows/     CI on Windows, macOS & Linux; release builds on version tags
+```
+
+Run the tests with `cargo test`. For an end-to-end check without a GPU, start
+`python3 tests/mock_server.py 11999` and point Cortex at `http://127.0.0.1:11999` (Ollama) or
+`http://127.0.0.1:11999/v1` (OpenAI).
+
+MIT licensed.

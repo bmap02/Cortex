@@ -1,0 +1,11 @@
+# Keep line endings right no matter which OS you commit from.
+* text=auto
+# Shell scripts must keep Unix line endings or they break on macOS/Linux.
+*.sh text eol=lf
+# Windows scripts prefer Windows line endings.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+# Never touch images.
+*.png binary
+*.ico binary
+*.icns binary

@@ -1,0 +1,380 @@
+//! Built-in tools the model can call. Each has a JSON schema (sent to the model)
+//! and an implementation. Tools that change things ask for approval first.
+
+use crate::config::{self, Config};
+use serde_json::{json, Value};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+const MAX_OUTPUT: usize = 12_000;
+const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"];
+
+pub struct Tool {
+    pub name: &'static str,
+    pub group: &'static str,
+    pub summary: &'static str,
+    /// Asks the user before running (unless auto-approve is on).
+    pub needs_approval: bool,
+    /// Needs `allow_network = true`.
+    pub network: bool,
+    params: fn() -> Value,
+}
+
+pub fn all() -> Vec<Tool> {
+    vec![
+        Tool { name: "read_file", group: "file", summary: "read a text file (with line numbers)", needs_approval: false, network: false,
+            params: || json!({"type":"object","properties":{
+                "path":{"type":"string"},
+                "offset":{"type":"integer","description":"first line to read, 1-based"},
+                "limit":{"type":"integer","description":"max lines to read (default 400)"}},"required":["path"]}) },
+        Tool { name: "write_file", group: "file", summary: "create or overwrite a file", needs_approval: true, network: false,
+            params: || json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}) },
+        Tool { name: "patch_file", group: "file", summary: "replace an exact snippet in a file", needs_approval: true, network: false,
+            params: || json!({"type":"object","properties":{
+                "path":{"type":"string"},
+                "old":{"type":"string","description":"exact text to find; must occur exactly once"},
+                "new":{"type":"string","description":"replacement text"}},"required":["path","old","new"]}) },
+        Tool { name: "list_dir", group: "file", summary: "list files in a directory", needs_approval: false, network: false,
+            params: || json!({"type":"object","properties":{
+                "path":{"type":"string","description":"default ."},
+                "depth":{"type":"integer","description":"recursion depth, default 2"}}}) },
+        Tool { name: "search_files", group: "file", summary: "regex search across files", needs_approval: false, network: false,
+            params: || json!({"type":"object","properties":{
+                "pattern":{"type":"string","description":"regular expression"},
+                "path":{"type":"string","description":"directory to search, default ."},
+                "file_glob":{"type":"string","description":"only files whose name ends with this, e.g. .rs"}},"required":["pattern"]}) },
+        Tool { name: "run_shell", group: "code", summary: "run a shell command (PowerShell on Windows, sh on macOS/Linux)", needs_approval: true, network: false,
+            params: || json!({"type":"object","properties":{
+                "command":{"type":"string"},
+                "timeout_secs":{"type":"integer","description":"default 60"}},"required":["command"]}) },
+        Tool { name: "run_python", group: "code", summary: "run a Python snippet and return its output", needs_approval: true, network: false,
+            params: || json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}) },
+        Tool { name: "calculator", group: "math", summary: "evaluate a math expression exactly", needs_approval: false, network: false,
+            params: || json!({"type":"object","properties":{"expression":{"type":"string","description":"e.g. (3.5*12)^2 / sqrt(2)"}},"required":["expression"]}) },
+        Tool { name: "fetch_url", group: "web", summary: "fetch a web page as text", needs_approval: false, network: true,
+            params: || json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}) },
+        Tool { name: "remember", group: "memory", summary: "save a fact to long-term memory", needs_approval: false, network: false,
+            params: || json!({"type":"object","properties":{"fact":{"type":"string","description":"one short durable fact about the user or project"}},"required":["fact"]}) },
+    ]
+}
+
+impl Tool {
+    pub fn enabled(&self, cfg: &Config) -> bool {
+        !cfg.disabled_tools.iter().any(|d| d == self.name) && (!self.network || cfg.allow_network)
+    }
+    pub fn schema(&self) -> Value {
+        json!({"type":"function","function":{"name":self.name,"description":self.summary,"parameters":(self.params)()}})
+    }
+}
+
+pub fn schemas(cfg: &Config) -> Vec<Value> {
+    all().iter().filter(|t| t.enabled(cfg)).map(|t| t.schema()).collect()
+}
+
+pub fn find(name: &str) -> Option<Tool> { all().into_iter().find(|t| t.name == name) }
+
+/// One-line description of a call, shown to the user and in approval prompts.
+pub fn describe(name: &str, a: &Value) -> String {
+    let s = |k: &str| a[k].as_str().unwrap_or("").to_string();
+    match name {
+        "read_file" => format!("read {}", s("path")),
+        "write_file" => format!("write {} ({} bytes)", s("path"), s("content").len()),
+        "patch_file" => format!("patch {}", s("path")),
+        "list_dir" => format!("list {}", if s("path").is_empty() { ".".into() } else { s("path") }),
+        "search_files" => format!("search /{}/ in {}", s("pattern"), if s("path").is_empty() { ".".into() } else { s("path") }),
+        "run_shell" => format!("$ {}", s("command")),
+        "run_python" => format!("python ({} lines)", s("code").lines().count()),
+        "calculator" => s("expression"),
+        "fetch_url" => s("url"),
+        "remember" => s("fact"),
+        _ => a.to_string(),
+    }
+}
+
+/// Extra detail shown before approval (the code or diff about to run/apply).
+pub fn preview(name: &str, a: &Value) -> Option<String> {
+    let s = |k: &str| a[k].as_str().unwrap_or("").to_string();
+    let clip = |t: String| if t.lines().count() > 30 { t.lines().take(30).collect::<Vec<_>>().join("\n") + "\n  ..." } else { t };
+    match name {
+        "write_file" => Some(clip(s("content"))),
+        "patch_file" => Some(clip(format!("- {}\n+ {}", s("old").replace('\n', "\n- "), s("new").replace('\n', "\n+ ")))),
+        "run_python" => Some(clip(s("code"))),
+        _ => None,
+    }
+}
+
+pub fn execute(name: &str, a: &Value, cfg: &Config) -> String {
+    let r = match name {
+        "read_file" => read_file(a),
+        "write_file" => write_file(a),
+        "patch_file" => patch_file(a),
+        "list_dir" => list_dir(a),
+        "search_files" => search_files(a),
+        "run_shell" => run_shell(a["command"].as_str().unwrap_or(""), a["timeout_secs"].as_u64().unwrap_or(60)),
+        "run_python" => run_python(a),
+        "calculator" => crate::calc::eval(a["expression"].as_str().unwrap_or(""))
+            .map(|v| if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", v as i64) } else { format!("{v}") }),
+        "fetch_url" if cfg.allow_network => fetch_url(a),
+        "fetch_url" => Err("network access is off (Cortex is offline by default). Run `cortex config set allow_network true` to enable.".into()),
+        "remember" => remember(a),
+        _ => Err(format!("unknown tool '{name}'")),
+    };
+    let out = match r { Ok(s) => s, Err(e) => format!("ERROR: {e}") };
+    truncate(out)
+}
+
+fn truncate(s: String) -> String {
+    if s.len() <= MAX_OUTPUT { return s; }
+    let mut cut = MAX_OUTPUT;
+    while !s.is_char_boundary(cut) { cut -= 1; }
+    format!("{}\n... [truncated, {} more bytes]", &s[..cut], s.len() - cut)
+}
+
+fn arg<'a>(a: &'a Value, k: &str) -> Result<&'a str, String> {
+    a[k].as_str().ok_or_else(|| format!("missing '{k}'"))
+}
+
+fn expand(p: &str) -> PathBuf {
+    if p == "~" { return config::user_home().unwrap_or_else(|| PathBuf::from(p)); }
+    if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
+        if let Some(h) = config::user_home() { return h.join(rest); }
+    }
+    PathBuf::from(p)
+}
+
+/// Which shell run_shell uses: PowerShell 7 (pwsh) or Windows PowerShell on Windows, sh elsewhere.
+pub fn shell_name() -> &'static str {
+    static SHELL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    SHELL.get_or_init(|| {
+        if !cfg!(windows) { return "sh"; }
+        let ok = |exe: &str| Command::new(exe).args(["-NoProfile", "-Command", "exit 0"]).stdin(Stdio::null())
+            .stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+        if ok("pwsh") { "pwsh" } else { "powershell" }
+    })
+}
+
+/// A Python that really runs (skips the Windows Store "python" stub, which exits with an error).
+fn python_exe() -> Option<&'static str> {
+    static PY: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *PY.get_or_init(|| {
+        let candidates: &[&'static str] = if cfg!(windows) { &["py", "python", "python3"] } else { &["python3", "python"] };
+        candidates.iter().copied().find(|exe| {
+            Command::new(exe).arg("--version").stdin(Stdio::null()).output().map(|o| o.status.success()).unwrap_or(false)
+        })
+    })
+}
+
+pub fn python_available() -> bool { python_exe().is_some() }
+
+fn read_file(a: &Value) -> Result<String, String> {
+    let path = expand(arg(a, "path")?);
+    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.iter().take(8000).any(|&b| b == 0) { return Err("binary file".into()); }
+    let text = String::from_utf8_lossy(&bytes);
+    let offset = a["offset"].as_u64().unwrap_or(1).max(1) as usize;
+    let limit = a["limit"].as_u64().unwrap_or(400) as usize;
+    let total = text.lines().count();
+    let mut out: String = text.lines().enumerate().skip(offset - 1).take(limit)
+        .map(|(i, l)| format!("{:>5}  {l}\n", i + 1)).collect();
+    if offset - 1 + limit < total { out += &format!("... ({} lines total; use offset to read more)\n", total); }
+    Ok(out)
+}
+
+fn write_file(a: &Value) -> Result<String, String> {
+    let path = expand(arg(a, "path")?);
+    let content = arg(a, "content")?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, content).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(format!("wrote {} bytes to {}", content.len(), path.display()))
+}
+
+fn patch_file(a: &Value) -> Result<String, String> {
+    let path = expand(arg(a, "path")?);
+    let (old, new) = (arg(a, "old")?, arg(a, "new")?);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    match text.matches(old).count() {
+        0 => Err("'old' text not found in file. Read the file again and copy the snippet exactly.".into()),
+        1 => {
+            std::fs::write(&path, text.replacen(old, new, 1)).map_err(|e| e.to_string())?;
+            Ok(format!("patched {}", path.display()))
+        }
+        n => Err(format!("'old' text occurs {n} times; include more surrounding lines so it is unique")),
+    }
+}
+
+fn list_dir(a: &Value) -> Result<String, String> {
+    let root = expand(a["path"].as_str().filter(|s| !s.is_empty()).unwrap_or("."));
+    let depth = a["depth"].as_u64().unwrap_or(2) as usize;
+    let mut out = String::new();
+    let mut count = 0;
+    fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut String, count: &mut usize) -> std::io::Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            if *count >= 500 { out.push_str("... (stopped at 500 entries)\n"); return Ok(()); }
+            let name = e.file_name().to_string_lossy().to_string();
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            *count += 1;
+            if is_dir {
+                out.push_str(&format!("{prefix}{name}/\n"));
+                if depth > 1 && !SKIP_DIRS.contains(&name.as_str()) {
+                    walk(&e.path(), &format!("{prefix}  "), depth - 1, out, count)?;
+                }
+            } else {
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push_str(&format!("{prefix}{name}  ({})\n", human(size)));
+            }
+        }
+        Ok(())
+    }
+    walk(&root, "", depth.max(1), &mut out, &mut count).map_err(|e| format!("{}: {e}", root.display()))?;
+    Ok(if out.is_empty() { "(empty)".into() } else { out })
+}
+
+fn human(b: u64) -> String {
+    match b { 0..=1023 => format!("{b} B"), 1024..=1_048_575 => format!("{:.1} KB", b as f64 / 1024.0), _ => format!("{:.1} MB", b as f64 / 1_048_576.0) }
+}
+
+fn search_files(a: &Value) -> Result<String, String> {
+    let re = regex::Regex::new(arg(a, "pattern")?).map_err(|e| e.to_string())?;
+    let root = expand(a["path"].as_str().filter(|s| !s.is_empty()).unwrap_or("."));
+    let glob = a["file_glob"].as_str().unwrap_or("").trim_start_matches('*').to_string();
+    let mut hits = vec![];
+    let mut stack = vec![root.clone()];
+    while let Some(p) = stack.pop() {
+        if hits.len() >= 100 { break; }
+        if p.is_dir() {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if p != root && SKIP_DIRS.contains(&name.as_str()) { continue; }
+            if let Ok(rd) = std::fs::read_dir(&p) { for e in rd.flatten() { stack.push(e.path()); } }
+        } else if glob.is_empty() || p.to_string_lossy().ends_with(&glob) {
+            let Ok(bytes) = std::fs::read(&p) else { continue };
+            if bytes.len() > 2_000_000 || bytes.iter().take(4000).any(|&b| b == 0) { continue; }
+            for (i, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
+                if re.is_match(line) {
+                    let l: String = line.trim().chars().take(200).collect();
+                    hits.push(format!("{}:{}: {l}", p.display(), i + 1));
+                    if hits.len() >= 100 { break; }
+                }
+            }
+        }
+    }
+    Ok(if hits.is_empty() { "no matches".into() } else { hits.join("\n") + if hits.len() >= 100 { "\n... (first 100 matches)" } else { "" } })
+}
+
+fn run_shell(cmd: &str, timeout: u64) -> Result<String, String> {
+    if cmd.trim().is_empty() { return Err("empty command".into()); }
+    let mut c = Command::new(shell_name());
+    if cfg!(windows) {
+        // UTF-8 output so non-ASCII text survives the pipe
+        c.args(["-NoProfile", "-NonInteractive", "-Command",
+            &format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Text.Encoding]::UTF8; {cmd}")]);
+    } else {
+        c.args(["-c", cmd]);
+    }
+    run_process(&mut c, timeout)
+}
+
+fn run_process(c: &mut Command, timeout: u64) -> Result<String, String> {
+    let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    let mut so = child.stdout.take().unwrap();
+    let mut se = child.stderr.take().unwrap();
+    // read bytes, not String: Windows tools often print in the console code page, not UTF-8
+    let t1 = std::thread::spawn(move || { let mut b = vec![]; let _ = so.read_to_end(&mut b); String::from_utf8_lossy(&b).replace("\r\n", "\n") });
+    let t2 = std::thread::spawn(move || { let mut b = vec![]; let _ = se.read_to_end(&mut b); String::from_utf8_lossy(&b).replace("\r\n", "\n") });
+    let start = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? { break Some(st); }
+        if start.elapsed() > Duration::from_secs(timeout) || crate::backend::INTERRUPT.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let (out, err) = (t1.join().unwrap_or_default(), t2.join().unwrap_or_default());
+    let mut s = String::new();
+    if !out.is_empty() { s += &out; }
+    if !err.is_empty() { s += &format!("[stderr]\n{err}"); }
+    match status {
+        None => s += &format!("\n[killed after {}s]", start.elapsed().as_secs()),
+        Some(st) if !st.success() => s += &format!("\n[exit code {}]", st.code().unwrap_or(-1)),
+        _ => {}
+    }
+    Ok(if s.trim().is_empty() { "(no output)".into() } else { s })
+}
+
+fn run_python(a: &Value) -> Result<String, String> {
+    let code = arg(a, "code")?;
+    let path = std::env::temp_dir().join(format!("cortex_{}.py", std::process::id()));
+    std::fs::write(&path, code).map_err(|e| e.to_string())?;
+    let py = python_exe().ok_or("Python isn't installed (tried python3, python, py)")?;
+    let r = run_process(Command::new(py).arg(&path).env("PYTHONIOENCODING", "utf-8"), 60);
+    let _ = std::fs::remove_file(&path);
+    r
+}
+
+fn fetch_url(a: &Value) -> Result<String, String> {
+    let url = arg(a, "url")?;
+    let body = ureq::get(url).timeout(Duration::from_secs(20)).call().map_err(|e| e.to_string())?
+        .into_string().map_err(|e| e.to_string())?;
+    // crude HTML → text: drop scripts/styles/tags, collapse whitespace
+    let re_block = regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>").unwrap();
+    let re_tag = regex::Regex::new(r"(?s)<[^>]+>").unwrap();
+    let re_ws = regex::Regex::new(r"\n\s*\n+").unwrap();
+    let t = re_block.replace_all(&body, "");
+    let t = re_tag.replace_all(&t, "\n");
+    let t = t.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'");
+    let t: String = t.lines().map(|l| l.trim()).collect::<Vec<_>>().join("\n");
+    Ok(re_ws.replace_all(&t, "\n\n").trim().to_string())
+}
+
+fn remember(a: &Value) -> Result<String, String> {
+    let fact = arg(a, "fact")?.trim().replace('\n', " ");
+    std::fs::create_dir_all(config::home()).map_err(|e| e.to_string())?;
+    let mut text = std::fs::read_to_string(config::memory_path()).unwrap_or_default();
+    if text.lines().any(|l| l.trim_start_matches("- ").eq_ignore_ascii_case(&fact)) { return Ok("already remembered".into()); }
+    if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
+    text += &format!("- {fact}\n");
+    std::fs::write(config::memory_path(), text).map_err(|e| e.to_string())?;
+    Ok("saved to memory".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn html_regexes_compile() {
+        let _ = regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>").unwrap();
+    }
+    #[test]
+    fn patch_requires_unique_match() {
+        let dir = std::env::temp_dir().join(format!("cortex_t{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "x = 1\ny = 1\n").unwrap();
+        let p = f.to_string_lossy().to_string();
+        assert!(patch_file(&json!({"path": p, "old": "= 1", "new": "= 2"})).is_err());
+        assert!(patch_file(&json!({"path": p, "old": "y = 1", "new": "y = 2"})).is_ok());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "x = 1\ny = 2\n");
+        assert!(search_files(&json!({"pattern": "y = 2", "path": dir.to_string_lossy()})).unwrap().contains("a.txt:2"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn shell_runs_and_times_out() {
+        assert!(run_shell("echo hi", 5).unwrap().contains("hi"));
+        let sleep = if cfg!(windows) { "Start-Sleep -Seconds 3" } else { "sleep 3" };
+        assert!(run_shell(sleep, 1).unwrap().contains("killed"));
+    }
+    #[test]
+    fn home_expansion() {
+        let h = config::user_home().unwrap();
+        assert_eq!(expand("~/x.txt"), h.join("x.txt"));
+        assert_eq!(expand("~\\x.txt"), h.join("x.txt"));
+        assert_eq!(expand("rel/x.txt"), PathBuf::from("rel/x.txt"));
+    }
+}
