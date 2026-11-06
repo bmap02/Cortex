@@ -3,6 +3,10 @@
   <img alt="Cortex" src="assets/readme-banner-light.svg">
 </picture>
 
+[![Latest release](https://img.shields.io/github/v/release/bmap02/Cortex)](https://github.com/bmap02/Cortex/releases/latest)
+[![CI](https://github.com/bmap02/Cortex/actions/workflows/ci.yml/badge.svg)](https://github.com/bmap02/Cortex/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A lightweight AI agent for your terminal that runs entirely on your machine, on
 Windows, macOS and Linux. It is a single ~5 MB Rust binary with no telemetry, and it talks to **Ollama** or
 **any OpenAI-compatible server** (llama.cpp, LM Studio, vLLM, LocalAI, Jan).
@@ -10,12 +14,34 @@ Windows, macOS and Linux. It is a single ~5 MB Rust binary with no telemetry, an
 - **Streaming chat** with history, multi-line input and Tab-completed `/commands`
 - **Agent tools**: read, write, patch, list and search files; run shell commands and Python;
   exact math; long-term memory
-- **Approval before changes**: shell commands, Python and file writes ask y/n/always first
+- **Approval before changes**: shell commands, Python and file writes ask y/n/always first, and
+  one "no" stops the agent and hands control back to you
 - **Cross-platform**: PowerShell on Windows, `sh` on macOS/Linux, colors in every modern terminal
 - **Sessions** are saved automatically and can be resumed with `cortex -r`
 - **Context management**: `/compress`, plus automatic compression when the context is ~85% full
 - **One-shot and pipe mode**: `git diff | cortex run -q "write a commit message"`
 - **Offline by default**: the `fetch_url` web tool stays off until you enable it
+
+## Quick start
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/bmap02/Cortex/main/install.ps1 | iex
+```
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/bmap02/Cortex/main/install.sh | sh
+```
+
+Then, with [Ollama](https://ollama.com/download) running and a model pulled (`ollama pull qwen2.5:7b`):
+
+```bash
+cortex setup
+cortex
+```
+
+The full guide is below.
 
 ## Installation
 
@@ -44,10 +70,20 @@ speaks their OpenAI-compatible API too.
 
 ### Step 2: Install Cortex
 
-#### Windows: all-in-one installer (from the source folder)
+#### Windows (recommended)
 
-Unzip the source, open the `cortex` folder and **double-click `install-windows.cmd`**. It installs
-anything that's missing and sets everything up:
+```powershell
+irm https://raw.githubusercontent.com/bmap02/Cortex/main/install.ps1 | iex
+```
+
+This downloads `cortex.exe` to `%LOCALAPPDATA%\Programs\cortex` and adds that folder to your
+PATH (no admin rights needed). **Open a new terminal** afterwards so the PATH change applies.
+
+#### Windows: build from source with one click
+
+If you'd rather build Cortex yourself, download the source (**Code → Download ZIP**), unzip it, open the
+folder and **double-click `install-windows.cmd`**. It installs anything that's missing and sets
+everything up:
 
 1. Microsoft C++ Build Tools (Rust needs them on Windows; Windows asks for admin permission)
 2. Rust
@@ -59,23 +95,15 @@ anything that's missing and sets everything up:
 Running it again is safe: finished steps are skipped. From PowerShell you can also run
 `powershell -ExecutionPolicy Bypass -File .\install-windows.ps1 -Model qwen2.5:7b`.
 
-#### Windows: prebuilt download (once a release is published)
-
-```powershell
-irm https://raw.githubusercontent.com/bmap02/Cortex/main/install.ps1 | iex
-```
-
-This downloads `cortex.exe` to `%LOCALAPPDATA%\Programs\cortex` and adds that folder to your
-PATH (no admin rights needed). **Open a new terminal** afterwards so the PATH change applies.
-
 #### macOS / Linux
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bmap02/Cortex/main/install.sh | sh
 ```
 
-This installs to `~/.local/bin/cortex`. If that folder isn't on your PATH, the script prints the
-line to add to your shell config.
+This installs to `~/.local/bin/cortex`. On most Linux distributions that folder is added to your
+PATH automatically, so just open a new terminal; otherwise the script prints the line to add to
+your shell config.
 
 Both scripts accept `CORTEX_VERSION=v0.1.0` to pin a version and `CORTEX_INSTALL_DIR` to change
 the location.
@@ -131,7 +159,9 @@ cortex           # start chatting
 
 ### Updating and uninstalling
 
-Run the install command again to update. To uninstall, delete the binary and the settings folder:
+Run the install command again to update (or re-run `install-windows.cmd` / `cargo install` if you
+built from source). To uninstall, delete the binary and the settings folder. If you built from
+source, run `cargo uninstall cortex` instead of deleting the binary.
 
 ```powershell
 # Windows
@@ -145,15 +175,20 @@ rm ~/.local/bin/cortex && rm -rf ~/.cortex
 
 ### Publishing a release (maintainers)
 
-Binaries are built by GitHub Actions. Push a version tag and the Release workflow builds every
-platform and attaches the archives and `SHA256SUMS.txt` to a new GitHub Release:
+Binaries are built by GitHub Actions. To publish a new version:
+
+1. Bump `version` in `Cargo.toml`, then run `cargo build` so `Cargo.lock` picks up the new version
+   (the release build uses `--locked` and fails if they disagree).
+2. Commit and push both files.
+3. Tag and push the tag:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.1.1 && git push origin v0.1.1
 ```
 
-The install scripts download from the latest release, so they work once the first tag has
-been published.
+The Release workflow builds every platform and attaches the archives and `SHA256SUMS.txt` to a new
+GitHub Release. The install scripts always download the latest release. If a release ever ends up
+without its files, open the tag's Release run in the Actions tab and choose **Re-run all jobs**.
 
 ## Model servers
 
@@ -187,10 +222,12 @@ cortex --ctx 32k                # bigger context window for this run
 cortex -r                       # resume the latest session (or: cortex -r <id>)
 cortex run "what's in this repo?"
 cat error.log | cortex run -q "what went wrong?"
+cortex run --no-tools "explain ownership in Rust"   # plain answer, no tool use
 cortex models                   # list models on the server
 cortex models pull qwen2.5:7b   # download (Ollama)
 cortex model qwen2.5:7b         # set the default model
 cortex tools                    # list tools; cortex tools disable run_shell
+cortex tools enable fetch_url   # let the agent read web pages (turns on network access)
 cortex config                   # show settings; cortex config set num_ctx 16384
 cortex sessions                 # list saved sessions
 cortex sessions delete <id>     # remove one
@@ -213,6 +250,7 @@ into system RAM, so step back down. With an OpenAI-compatible server, the server
 
 | | |
 |---|---|
+| `/help` | list all commands |
 | `/model [name]` | show or switch the model |
 | `/models` `/tools` | list models / tools |
 | `/new` | fresh conversation |
@@ -225,6 +263,7 @@ into system RAM, so step back down. With an OpenAI-compatible server, the server
 | `/sessions clear` `/sessions delete <id>` | remove all / one saved session |
 | `/yolo` | toggle auto-approve |
 | `/system` | show the system prompt |
+| `/exit` | quit (also Ctrl+D) |
 
 Ctrl+C stops a reply or a running command. End a line with `\` to keep typing on the next line.
 

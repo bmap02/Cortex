@@ -25,7 +25,16 @@ $Tmp = Join-Path ([IO.Path]::GetTempPath()) ("cortex-" + [Guid]::NewGuid())
 New-Item -ItemType Directory -Force $Tmp | Out-Null
 try {
     Write-Host "Downloading $Url"
-    Invoke-WebRequest -Uri $Url -OutFile (Join-Path $Tmp 'cortex.zip') -UseBasicParsing
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile (Join-Path $Tmp 'cortex.zip') -UseBasicParsing
+    } catch {
+        Write-Host ""
+        Write-Host "Couldn't download Cortex: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  - No release published yet? Check https://github.com/$Repo/releases"
+        Write-Host "  - Pinned a version? Make sure CORTEX_VERSION=$Version exists."
+        Write-Host "  - Or build from source: download the repo and run install-windows.cmd"
+        return
+    }
     Expand-Archive -Path (Join-Path $Tmp 'cortex.zip') -DestinationPath $Tmp -Force
     New-Item -ItemType Directory -Force $Dir | Out-Null
     Copy-Item (Join-Path $Tmp 'cortex.exe') (Join-Path $Dir 'cortex.exe') -Force
