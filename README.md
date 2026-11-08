@@ -34,7 +34,8 @@ irm https://raw.githubusercontent.com/bmap02/Cortex/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/bmap02/Cortex/main/install.sh | sh
 ```
 
-Then, with [Ollama](https://ollama.com/download) running and a model pulled (`ollama pull qwen2.5:7b`):
+Then open a new terminal (on macOS/Linux, if the installer printed a PATH line, add it first) and,
+with [Ollama](https://ollama.com/download) running and a model pulled (`ollama pull qwen2.5:7b`):
 
 ```bash
 cortex setup
@@ -101,11 +102,11 @@ Running it again is safe: finished steps are skipped. From PowerShell you can al
 curl -fsSL https://raw.githubusercontent.com/bmap02/Cortex/main/install.sh | sh
 ```
 
-This installs to `~/.local/bin/cortex`. On most Linux distributions that folder is added to your
-PATH automatically, so just open a new terminal; otherwise the script prints the line to add to
-your shell config.
+This installs to `~/.local/bin/cortex`. If that folder isn't on your PATH yet, the script prints the
+commands to add it. (On Ubuntu and Debian, `~/.profile` adds it automatically, but only at login: if
+the folder is new, log out and back in, or run `. ~/.profile`.)
 
-Both scripts accept `CORTEX_VERSION=v0.1.0` to pin a version and `CORTEX_INSTALL_DIR` to change
+`install.ps1` and `install.sh` accept `CORTEX_VERSION=v0.1.0` to pin a version and `CORTEX_INSTALL_DIR` to change
 the location.
 
 #### Manual download
@@ -159,26 +160,33 @@ cortex           # start chatting
 
 ### Updating and uninstalling
 
-Run the install command again to update (or re-run `install-windows.cmd` / `cargo install` if you
-built from source). To uninstall, delete the binary and the settings folder. If you built from
-source, run `cargo uninstall cortex` instead of deleting the binary.
+Run the install command again to update; it works even while Cortex is open. If you built from
+source, get the new source first: run `cargo install --git https://github.com/bmap02/Cortex` again,
+`git pull` before `cargo install --path .`, or download a fresh ZIP before running
+`install-windows.cmd` (note that it also re-applies its Ollama settings to your config).
+
+To uninstall, delete the binary and the settings folder:
 
 ```powershell
 # Windows
-Remove-Item "$env:LOCALAPPDATA\Programs\cortex" -Recurse; Remove-Item "$env:USERPROFILE\.cortex" -Recurse
+Remove-Item "$env:LOCALAPPDATA\Programs\cortex" -Recurse -ErrorAction SilentlyContinue
+Remove-Item "$env:USERPROFILE\.cortex" -Recurse
 ```
 
 ```bash
 # macOS / Linux
-rm ~/.local/bin/cortex && rm -rf ~/.cortex
+rm -f ~/.local/bin/cortex; rm -rf ~/.cortex
 ```
+
+If you built from source, run `cargo uninstall cortex` instead of deleting the binary. The one-click
+Windows build also leaves its build cache in `%LOCALAPPDATA%\cortex-build`, which you can delete.
 
 ### Publishing a release (maintainers)
 
 Binaries are built by GitHub Actions. To publish a new version:
 
-1. Bump `version` in `Cargo.toml`, then run `cargo build` so `Cargo.lock` picks up the new version
-   (the release build uses `--locked` and fails if they disagree).
+1. Bump `version` in `Cargo.toml`, then run `cargo update -w` so `Cargo.lock` picks up the new version
+   (CI and the release build use `--locked` and fail if they disagree).
 2. Commit and push both files.
 3. Tag and push the tag:
 
@@ -188,7 +196,7 @@ git tag v0.1.1 && git push origin v0.1.1
 
 The Release workflow builds every platform and attaches the archives and `SHA256SUMS.txt` to a new
 GitHub Release. The install scripts always download the latest release. If a release ever ends up
-without its files, open the tag's Release run in the Actions tab and choose **Re-run all jobs**.
+without its files, open the tag's Release run in the Actions tab and choose **Re-run failed jobs**.
 
 ## Model servers
 

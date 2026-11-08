@@ -19,8 +19,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D clippy::correctness
-      - run: cargo test
+      # --locked: fail here if Cargo.lock is out of date (the release build would fail later)
+      - run: cargo clippy --locked --all-targets -- -D clippy::correctness
+      - run: cargo test --locked
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -43,7 +44,7 @@ jobs:
           done
           curl -sS --max-time 5 http://127.0.0.1:11999/api/tags
           echo
-          cargo build
+          cargo build --locked
           BIN=target/debug/cortex
           $BIN config set base_url http://127.0.0.1:11999
           $BIN config set model mock:7b

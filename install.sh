@@ -62,14 +62,15 @@ case ":$PATH:" in
   *":$DIR:"*) ;;
   *)
     echo
-    if [ "$DIR" = "$HOME/.local/bin" ] && grep -qs '.local/bin' "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zprofile"; then
-      # Ubuntu, Debian, Fedora etc. add ~/.local/bin automatically once it exists
-      echo "Open a new terminal and 'cortex' will be on your PATH."
+    echo "$DIR isn't on your PATH yet. To use cortex in this terminal, run:"
+    echo "  export PATH=\"$DIR:\$PATH\""
+    if [ "$DIR" = "$HOME/.local/bin" ] && grep -qs '\.local/bin' "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zprofile"; then
+      # e.g. Ubuntu/Debian: ~/.profile adds ~/.local/bin, but only if it existed at login
+      echo "Your login profile adds it automatically from your next login (log out and back in)."
     else
       rc="$HOME/.$(basename "${SHELL:-sh}")rc"
-      echo "Add $DIR to your PATH:"
+      echo "To make it permanent:"
       echo "  echo 'export PATH=\"$DIR:\$PATH\"' >> $rc"
-      echo "then open a new terminal."
     fi ;;
 esac
 echo
