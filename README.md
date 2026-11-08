@@ -106,8 +106,9 @@ This installs to `~/.local/bin/cortex`. If that folder isn't on your PATH yet, t
 commands to add it. (On Ubuntu and Debian, `~/.profile` adds it automatically, but only at login: if
 the folder is new, log out and back in, or run `. ~/.profile`.)
 
-`install.ps1` and `install.sh` accept `CORTEX_VERSION=v0.1.0` to pin a version and `CORTEX_INSTALL_DIR` to change
-the location.
+`install.ps1` and `install.sh` accept `CORTEX_VERSION=v0.1.0` to pin a version, `CORTEX_INSTALL_DIR` to change
+the location and `CORTEX_RELEASES_URL` to download from a mirror. Both check the download against the
+release's `SHA256SUMS.txt` and stop if it doesn't match.
 
 #### Manual download
 

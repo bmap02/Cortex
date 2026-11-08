@@ -48,10 +48,19 @@ pub fn list_sessions() -> Vec<(String, String, usize)> {
     v
 }
 
+/// Ids of saved sessions, newest first, from the file names (without reading the files).
+pub fn session_ids() -> Vec<String> {
+    let mut ids: Vec<String> = std::fs::read_dir(config::sessions_dir()).into_iter().flatten().flatten()
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".json").map(String::from))
+        .collect();
+    ids.sort_by(|a, b| b.cmp(a));
+    ids
+}
+
 /// Delete saved sessions: all of them (None) or the one whose id starts with `prefix`.
 pub fn delete_sessions(prefix: Option<&str>) -> Result<usize, String> {
-    let ids: Vec<String> = list_sessions().into_iter().map(|s| s.0)
-        .filter(|id| prefix.map(|p| id.starts_with(p)).unwrap_or(true)).collect();
+    let ids: Vec<String> = session_ids().into_iter()
+        .filter(|id| prefix.is_none_or(|p| id.starts_with(p))).collect();
     if let Some(p) = prefix {
         if ids.is_empty() { return Err(format!("no session matches '{p}'")); }
         if ids.len() > 1 { return Err(format!("'{p}' matches {} sessions; use more of the id", ids.len())); }
@@ -63,10 +72,11 @@ pub fn delete_sessions(prefix: Option<&str>) -> Result<usize, String> {
     Ok(n)
 }
 
-pub fn load_session(id: &str) -> Option<Session> {
-    let ids: Vec<String> = list_sessions().into_iter().map(|s| s.0).filter(|s| s.starts_with(id)).collect();
-    let id = ids.first()?;
-    serde_json::from_str(&std::fs::read_to_string(config::sessions_dir().join(format!("{id}.json"))).ok()?).ok()
+/// The newest readable session whose id starts with `prefix` ("" = the latest one).
+pub fn load_session(prefix: &str) -> Option<Session> {
+    session_ids().into_iter().filter(|id| id.starts_with(prefix)).find_map(|id| {
+        serde_json::from_str(&std::fs::read_to_string(config::sessions_dir().join(format!("{id}.json"))).ok()?).ok()
+    })
 }
 
 pub struct Agent {
@@ -100,12 +110,10 @@ You can call tools to read and edit files, search code, run shell commands and P
     let folders: Vec<String> = ["Desktop", "Documents", "Downloads"].iter()
         .filter_map(|n| config::user_folder(n).map(|p| format!("{n} = {}", p.display()))).collect();
     if !folders.is_empty() { s += &format!("\nUser folders: {}.", folders.join(", ")); }
-    if let Ok(soul) = std::fs::read_to_string(config::soul_path()) {
-        if !soul.trim().is_empty() { s += &format!("\n\n# Persona\n{}", soul.trim()); }
-    }
-    if let Ok(mem) = std::fs::read_to_string(config::memory_path()) {
-        if !mem.trim().is_empty() { s += &format!("\n\n# What you remember about the user\n{}", mem.trim()); }
-    }
+    if let Ok(soul) = std::fs::read_to_string(config::soul_path())
+        && !soul.trim().is_empty() { s += &format!("\n\n# Persona\n{}", soul.trim()); }
+    if let Ok(mem) = std::fs::read_to_string(config::memory_path())
+        && !mem.trim().is_empty() { s += &format!("\n\n# What you remember about the user\n{}", mem.trim()); }
     s
 }
 
@@ -159,7 +167,7 @@ impl Agent {
     }
 
     /// Ask a y/n/always question on stdin.
-    fn approve(&mut self, what: &str, preview: Option<String>) -> bool {
+    fn approve(&mut self, preview: Option<String>) -> bool {
         if self.approve_all { return true; }
         if let Some(p) = preview {
             for l in p.lines() { ui::outln(&format!("    {}", ui::faint(l))); }
@@ -171,7 +179,7 @@ impl Agent {
         match line.trim().to_lowercase().as_str() {
             "y" | "yes" => true,
             "a" | "always" => { self.approve_all = true; true }
-            _ => { let _ = what; false }
+            _ => false,
         }
     }
 
@@ -205,8 +213,6 @@ impl Agent {
                 Err(BackendError::ToolsUnsupported(m)) if self.tools_supported => {
                     self.tools_supported = false;
                     if !quiet { ui::outln(&ui::faint(&format!("  ({}: {m}. Continuing as plain chat; pick a tool-capable model for agent features.)", self.model))); }
-                    let mut printed = false;
-                    let mut on_text = |t: &str| { if !printed { if !quiet { ui::out("\n"); } printed = true; } ui::out(t); };
                     self.backend.chat(&self.cfg, &self.model, &self.msgs, &[], &mut on_text).map_err(|e| e.to_string())?
                 }
                 Err(e) => { self.msgs.pop_if_user(); return Err(e.to_string()); }
@@ -238,12 +244,12 @@ impl Agent {
                 }
                 tool_calls_made += 1;
                 let desc = tools::describe(&call.name, &call.args);
-                if !quiet { ui::outln(&format!("  {} {}", ui::paint("⚙", ui::WHITE, true), ui::muted(&ui::truncate(&format!("{}: {desc}", call.name), 110)))); }
+                if !quiet { ui::outln(&format!("  {} {}", ui::paint(ui::TOOL_MARK, ui::WHITE, true), ui::muted(&ui::truncate(&format!("{}: {desc}", call.name), 110)))); }
                 let tool = tools::find(&call.name);
                 let result = match &tool {
                     None => format!("ERROR: unknown tool '{}'", call.name),
                     Some(t) if !t.enabled(&self.cfg) => format!("ERROR: tool '{}' is disabled", call.name),
-                    Some(t) if t.needs_approval && !self.approve(&desc, tools::preview(&call.name, &call.args)) => {
+                    Some(t) if t.needs_approval && !self.approve(tools::preview(&call.name, &call.args)) => {
                         declined = true;
                         "The user declined this action. Do not retry it or try a workaround; wait for their instructions.".to_string()
                     }
@@ -276,14 +282,22 @@ impl Agent {
         Ok(final_text)
     }
 
-    /// Replace the conversation so far with a model-written summary.
+    /// Replace the earlier conversation with a model-written summary. The latest user turn
+    /// (and any tool calls after it) is kept as is, so a request in progress isn't lost.
     pub fn compress(&mut self) -> Result<(), String> {
         if self.msgs.len() <= 2 { return Ok(()); }
-        let mut req = self.msgs.clone();
+        let split = compress_split(&self.msgs);
+        let mut req = self.msgs[..split].to_vec();
         req.push(Msg::new("user", "Summarize our conversation so far for your own future reference: the user's goals, key facts, decisions, files touched and anything still open. Be dense; bullet points."));
         let r = self.backend.chat(&self.cfg, &self.model, &req, &[], &mut |_| {}).map_err(|e| e.to_string())?;
+        let mut tail = self.msgs.split_off(split);
+        // Everything was summarized but a request is still being worked on (the last message is the
+        // user's or a tool result): repeat the request so the model still has something to answer.
+        if tail.is_empty() && self.msgs.last().is_some_and(|m| m.role != "assistant")
+            && let Some(u) = self.msgs.iter().rfind(|m| m.role == "user") { tail.push(u.clone()); }
         let sys = self.msgs[0].clone();
         self.msgs = vec![sys, Msg::new("user", format!("[Summary of the earlier conversation]\n{}", r.content)), Msg::new("assistant", "Understood, I have the context.")];
+        self.msgs.extend(tail);
         self.last = Usage::default();
         Ok(())
     }
@@ -298,6 +312,15 @@ impl Agent {
     }
 }
 
+/// Index where compression splits the conversation: messages before the latest user turn are
+/// summarized, the rest is kept. With no earlier turn to keep apart, everything is summarized.
+fn compress_split(msgs: &[Msg]) -> usize {
+    match msgs.iter().rposition(|m| m.role == "user") {
+        Some(i) if i > 1 => i,
+        _ => msgs.len(),
+    }
+}
+
 trait PopIfUser { fn pop_if_user(&mut self); }
 impl PopIfUser for Vec<Msg> {
     fn pop_if_user(&mut self) { if self.last().map(|m| m.role == "user").unwrap_or(false) { self.pop(); } }
@@ -305,6 +328,19 @@ impl PopIfUser for Vec<Msg> {
 
 #[cfg(test)]
 mod tests {
+    use super::{compress_split, Msg};
+
+    #[test]
+    fn compress_keeps_the_latest_turn() {
+        let m = |role: &str| Msg::new(role, "x");
+        // sys, old exchange, new user message + tool call + tool result: keep from the new user message
+        let msgs = vec![m("system"), m("user"), m("assistant"), m("user"), m("assistant"), m("tool")];
+        assert_eq!(compress_split(&msgs), 3);
+        // only one user turn: nothing earlier to summarize separately, so summarize it all
+        let msgs = vec![m("system"), m("user"), m("assistant"), m("tool")];
+        assert_eq!(compress_split(&msgs), 4);
+    }
+
     #[test]
     fn dates() {
         assert_eq!(super::civil_from_days(0), (1970, 1, 1));

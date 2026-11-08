@@ -22,8 +22,10 @@ pub struct Tool {
     params: fn() -> Value,
 }
 
-pub fn all() -> Vec<Tool> {
-    vec![
+/// Every built-in tool, built once at compile time.
+pub fn all() -> &'static [Tool] { &TOOLS }
+
+static TOOLS: [Tool; 10] = [
         Tool { name: "read_file", group: "file", summary: "read a text file (with line numbers)", needs_approval: false, network: false,
             params: || json!({"type":"object","properties":{
                 "path":{"type":"string"},
@@ -57,8 +59,7 @@ pub fn all() -> Vec<Tool> {
             params: || json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}) },
         Tool { name: "remember", group: "memory", summary: "save a fact to long-term memory", needs_approval: false, network: false,
             params: || json!({"type":"object","properties":{"fact":{"type":"string","description":"one short durable fact about the user or project"}},"required":["fact"]}) },
-    ]
-}
+];
 
 impl Tool {
     pub fn enabled(&self, cfg: &Config) -> bool {
@@ -73,7 +74,7 @@ pub fn schemas(cfg: &Config) -> Vec<Value> {
     all().iter().filter(|t| t.enabled(cfg)).map(|t| t.schema()).collect()
 }
 
-pub fn find(name: &str) -> Option<Tool> { all().into_iter().find(|t| t.name == name) }
+pub fn find(name: &str) -> Option<&'static Tool> { all().iter().find(|t| t.name == name) }
 
 /// One-line description of a call, shown to the user and in approval prompts.
 pub fn describe(name: &str, a: &Value) -> String {
@@ -138,9 +139,8 @@ fn arg<'a>(a: &'a Value, k: &str) -> Result<&'a str, String> {
 
 fn expand(p: &str) -> PathBuf {
     if p == "~" { return config::user_home().unwrap_or_else(|| PathBuf::from(p)); }
-    if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
-        if let Some(h) = config::user_home() { return h.join(rest); }
-    }
+    if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\"))
+        && let Some(h) = config::user_home() { return h.join(rest); }
     PathBuf::from(p)
 }
 
@@ -178,7 +178,7 @@ fn read_file(a: &Value) -> Result<String, String> {
     let total = text.lines().count();
     let mut out: String = text.lines().enumerate().skip(offset - 1).take(limit)
         .map(|(i, l)| format!("{:>5}  {l}\n", i + 1)).collect();
-    if offset - 1 + limit < total { out += &format!("... ({} lines total; use offset to read more)\n", total); }
+    if (offset - 1).saturating_add(limit) < total { out += &format!("... ({} lines total; use offset to read more)\n", total); }
     Ok(out)
 }
 
@@ -221,8 +221,11 @@ fn list_dir(a: &Value) -> Result<String, String> {
             *count += 1;
             if is_dir {
                 out.push_str(&format!("{prefix}{name}/\n"));
-                if depth > 1 && !SKIP_DIRS.contains(&name.as_str()) {
-                    walk(&e.path(), &format!("{prefix}  "), depth - 1, out, count)?;
+                // a subfolder we can't open (e.g. System32\config) is noted, not fatal
+                if depth > 1 && !SKIP_DIRS.contains(&name.as_str())
+                    && let Err(err) = walk(&e.path(), &format!("{prefix}  "), depth - 1, out, count) {
+                    let why = if err.kind() == std::io::ErrorKind::PermissionDenied { "access denied".to_string() } else { err.to_string() };
+                    out.push_str(&format!("{prefix}  ({why})\n"));
                 }
             } else {
                 let size = e.metadata().map(|m| m.len()).unwrap_or(0);
@@ -322,15 +325,22 @@ fn fetch_url(a: &Value) -> Result<String, String> {
     let url = arg(a, "url")?;
     let body = ureq::get(url).timeout(Duration::from_secs(20)).call().map_err(|e| e.to_string())?
         .into_string().map_err(|e| e.to_string())?;
-    // crude HTML → text: drop scripts/styles/tags, collapse whitespace
-    let re_block = regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>").unwrap();
-    let re_tag = regex::Regex::new(r"(?s)<[^>]+>").unwrap();
-    let re_ws = regex::Regex::new(r"\n\s*\n+").unwrap();
-    let t = re_block.replace_all(&body, "");
-    let t = re_tag.replace_all(&t, "\n");
-    let t = t.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'");
-    let t: String = t.lines().map(|l| l.trim()).collect::<Vec<_>>().join("\n");
-    Ok(re_ws.replace_all(&t, "\n\n").trim().to_string())
+    Ok(html_to_text(&body))
+}
+
+/// Crude HTML → text: drop scripts/styles/tags, decode common entities, collapse blank lines.
+fn html_to_text(html: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static BLOCKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>").unwrap());
+    static TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]+>").unwrap());
+    static BLANK_LINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n\s*\n+").unwrap());
+    let t = BLOCKS.replace_all(html, "");
+    let t = TAGS.replace_all(&t, "\n");
+    // &amp; last, so "&amp;lt;" becomes "&lt;" rather than "<"
+    let t = t.replace("&nbsp;", " ").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&");
+    let t: String = t.lines().map(str::trim).collect::<Vec<_>>().join("\n");
+    BLANK_LINES.replace_all(&t, "\n\n").trim().to_string()
 }
 
 fn remember(a: &Value) -> Result<String, String> {
@@ -348,8 +358,25 @@ fn remember(a: &Value) -> Result<String, String> {
 mod tests {
     use super::*;
     #[test]
-    fn html_regexes_compile() {
-        let _ = regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>").unwrap();
+    fn html_to_text_strips_markup() {
+        let html = "<html><style>p{}</style><p>a &amp; b</p>\n\n\n<script>alert(1)</script><p>&amp;lt;x&gt;</p></html>";
+        assert_eq!(html_to_text(html), "a & b\n\n&lt;x>");
+    }
+    #[test]
+    fn list_dir_skips_unreadable_subfolders() {
+        // System32 has subfolders only administrators can open (config, DriverState, ...)
+        if !cfg!(windows) { return; }
+        let root = std::env::var("SystemRoot").unwrap_or(r"C:\Windows".into());
+        let out = list_dir(&json!({"path": format!(r"{root}\System32"), "depth": 2})).unwrap();
+        assert!(out.contains("(access denied)"), "a locked subfolder should be noted, not fail the listing");
+    }
+    #[test]
+    fn read_file_handles_huge_limit() {
+        let f = std::env::temp_dir().join(format!("cortex_r{}.txt", std::process::id()));
+        std::fs::write(&f, "one\ntwo\n").unwrap();
+        let out = read_file(&json!({"path": f.to_string_lossy(), "offset": 2, "limit": u64::MAX})).unwrap();
+        std::fs::remove_file(&f).unwrap();
+        assert_eq!(out, "    2  two\n");
     }
     #[test]
     fn patch_requires_unique_match() {

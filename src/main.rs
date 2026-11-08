@@ -102,7 +102,7 @@ fn main() {
         Cmd::Chat => { chat(cfg, cli.resume); 0 }
         Cmd::Run { prompt, quiet, no_tools } => run_once(cfg, prompt.join(" "), quiet, no_tools),
         Cmd::Setup => { setup(); 0 }
-        Cmd::Model { name } => pick_model(cfg, name),
+        Cmd::Model { name } => pick_model(&cfg, name),
         Cmd::Models { action } => match action.unwrap_or(ModelsCmd::List) {
             ModelsCmd::List => print_models(&cfg),
             ModelsCmd::Pull { name } => match Backend::new(&cfg).pull(&name) {
@@ -110,8 +110,8 @@ fn main() {
                 Err(e) => { eprintln!("{}", ui::error(&e.to_string())); 1 }
             },
         },
-        Cmd::Tools { action, name } => tools_cmd(cfg, action, name),
-        Cmd::Config { action, key, value } => config_cmd(cfg, action, key, value),
+        Cmd::Tools { action, name } => tools_cmd(&cfg, action, name),
+        Cmd::Config { action, key, value } => config_cmd(action, key, value),
         Cmd::Sessions { action, id, yes } => sessions_cmd(action.as_deref().unwrap_or("list"), id.as_deref().unwrap_or(""), yes),
         Cmd::Doctor => doctor(&cfg),
     };
@@ -179,8 +179,9 @@ fn banner_info(agent: &Agent) -> ui::BannerInfo {
         }
         Err(e) => sections.push(ui::Section { title: "Models".into(), rows: vec![("server".into(), format!("unreachable at {} ({})", cfg.base_url, short(&e.to_string())))] }),
     }
+    let enabled: Vec<&tools::Tool> = tools::all().iter().filter(|t| t.enabled(cfg)).collect();
     let mut groups: Vec<(String, Vec<String>)> = vec![];
-    for t in tools::all().iter().filter(|t| t.enabled(cfg)) {
+    for t in &enabled {
         match groups.iter_mut().find(|g| g.0 == t.group) {
             Some(g) => g.1.push(t.name.into()),
             None => groups.push((t.group.into(), vec![t.name.into()])),
@@ -189,7 +190,7 @@ fn banner_info(agent: &Agent) -> ui::BannerInfo {
     if !cfg.allow_network { groups.push(("web".into(), vec!["fetch_url (off · offline mode)".into()])); }
     sections.push(ui::Section { title: "Tools".into(), rows: groups.into_iter().map(|(g, v)| (g, v.join(", "))).collect() });
 
-    let ntools = tools::all().iter().filter(|t| t.enabled(cfg)).count();
+    let ntools = enabled.len();
     let mem = std::fs::read_to_string(config::memory_path()).map(|s| s.lines().filter(|l| l.starts_with("- ")).count()).unwrap_or(0);
     ui::BannerInfo {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -208,7 +209,7 @@ fn short(s: &str) -> String { ui::truncate(s.split(':').next_back().unwrap_or(s)
 fn parse_ctx(s: &str) -> Result<usize, String> { config::parse_tokens(s) }
 
 fn fmt_tokens(n: usize) -> String {
-    if n >= 1024 && n % 1024 == 0 { format!("{}k", n / 1024) } else { n.to_string() }
+    if n >= 1024 && n.is_multiple_of(1024) { format!("{}k", n / 1024) } else { n.to_string() }
 }
 
 /// `/context` shows the window; `/context 32k` changes it and saves it as the default.
@@ -226,10 +227,10 @@ fn context_cmd(agent: &mut Agent, arg: &str) {
         Err(e) => { println!("{}", ui::error(&e)); return; }
     };
     agent.cfg.num_ctx = n;
-    let mut saved = Config::load();
-    saved.num_ctx = n;
-    let _ = saved.save();
-    println!("{}", ui::muted(&format!("context window → {} tokens (saved as default)", fmt_tokens(n))));
+    match Config::update(|c| { c.num_ctx = n; Ok(()) }) {
+        Ok(()) => println!("{}", ui::muted(&format!("context window → {} tokens (saved as default)", fmt_tokens(n)))),
+        Err(e) => println!("{}", ui::error(&format!("context window → {} tokens for this session; {e}", fmt_tokens(n)))),
+    }
     if let Some(m) = max.filter(|m| n > *m) {
         println!("{}", ui::error(&format!("  {} was trained for {} tokens; going past that usually degrades answers.", agent.model, fmt_tokens(m))));
     }
@@ -250,14 +251,13 @@ fn gauges() -> Vec<ui::Gauge> {
     let mut g = vec![];
     // NVIDIA GPU via nvidia-smi when available (no extra dependencies)
     if let Ok(o) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name,memory.used,memory.total", "--format=csv,noheader,nounits"]).output() {
-        if let Some(line) = String::from_utf8_lossy(&o.stdout).lines().next() {
+        .args(["--query-gpu=name,memory.used,memory.total", "--format=csv,noheader,nounits"]).output()
+        && let Some(line) = String::from_utf8_lossy(&o.stdout).lines().next() {
             let p: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
             if let (Some(name), Some(Ok(u)), Some(Ok(t))) = (p.first(), p.get(1).map(|s| s.parse::<f64>()), p.get(2).map(|s| s.parse::<f64>())) {
                 g.push(ui::Gauge { label: "gpu".into(), frac: u / t, detail: format!("{:.1}/{:.1} GB  {name}", u / 1024.0, t / 1024.0) });
             }
         }
-    }
     let Ok(mut sys) = sysinfo::System::new() else { return g };
     sys.refresh_memory();
     let (used, total) = (sys.used_memory() as f64 / 1e9, sys.total_memory() as f64 / 1e9);
@@ -268,6 +268,16 @@ fn gauges() -> Vec<ui::Gauge> {
     let cpu = sys.global_cpu_usage() as f64;
     g.push(ui::Gauge { label: "cpu".into(), frac: cpu / 100.0, detail: format!("{cpu:.0}%  {} cores", sys.cpus().len()) });
     g
+}
+
+/// The current folder, if it's inside the Windows folder (e.g. C:\WINDOWS\System32, where
+/// Win+R, admin terminals and shortcuts without "Start in" open).
+fn in_windows_folder() -> Option<String> {
+    if !cfg!(windows) { return None; }
+    let sys = std::env::var("SystemRoot").ok()?.to_lowercase();
+    let cwd = std::env::current_dir().ok()?.display().to_string();
+    let lower = cwd.to_lowercase();
+    (lower == sys || lower.starts_with(&format!("{sys}\\"))).then_some(cwd)
 }
 
 fn chat(cfg: Config, resume: Option<String>) {
@@ -285,6 +295,10 @@ fn chat(cfg: Config, resume: Option<String>) {
     }
     if agent.cfg.show_banner { print!("{}", ui::banner(&banner_info(&agent))); }
     if agent.model.is_empty() { println!("{}", ui::error("No model selected. Use /model <name> (see /models).")); }
+    if let Some(dir) = in_windows_folder() {
+        println!("{}", ui::error(&format!("Cortex is running in {dir}: its file tools start from this Windows system folder, and much of it is locked.")));
+        println!("{}", ui::faint("  Quit (/exit), cd to your project folder and run cortex again."));
+    }
 
     let mut rl: Editor<SlashHelper, rustyline::history::DefaultHistory> = match Editor::new() {
         Ok(r) => r,
@@ -338,8 +352,10 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
             agent.model = arg.to_string();
             agent.tools_supported = true;
             agent.cfg.model = arg.to_string();
-            let _ = agent.cfg.save();
-            println!("{}", ui::muted(&format!("model → {arg} (saved as default)")));
+            match Config::update(|c| { c.model = arg.to_string(); Ok(()) }) {
+                Ok(()) => println!("{}", ui::muted(&format!("model → {arg} (saved as default)"))),
+                Err(e) => println!("{}", ui::error(&format!("model → {arg} for this session; {e}"))),
+            }
         }
         "/models" => { print_models(&agent.cfg); }
         "/tools" => print_tools(&agent.cfg),
@@ -503,10 +519,12 @@ fn print_models(cfg: &Config) -> i32 {
     }
 }
 
-fn pick_model(mut cfg: Config, name: Option<String>) -> i32 {
-    let Some(name) = name else { return print_models(&cfg) };
-    cfg.model = name.clone();
-    match cfg.save() { Ok(()) => { println!("default model → {name}"); 0 } Err(e) => { eprintln!("{e}"); 1 } }
+fn pick_model(cfg: &Config, name: Option<String>) -> i32 {
+    let Some(name) = name else { return print_models(cfg) };
+    match Config::update(|c| { c.model = name.clone(); Ok(()) }) {
+        Ok(()) => { println!("default model → {name}"); 0 }
+        Err(e) => { eprintln!("{e}"); 1 }
+    }
 }
 
 fn print_tools(cfg: &Config) {
@@ -519,29 +537,34 @@ fn print_tools(cfg: &Config) {
     }
 }
 
-fn tools_cmd(mut cfg: Config, action: Option<String>, name: Option<String>) -> i32 {
+fn tools_cmd(cfg: &Config, action: Option<String>, name: Option<String>) -> i32 {
     match (action.as_deref(), name) {
-        (None, _) | (Some("list"), _) => { print_tools(&cfg); 0 }
+        (None | Some("list"), _) => { print_tools(cfg); 0 }
         (Some(a @ ("enable" | "disable")), Some(n)) => {
             if tools::find(&n).is_none() { eprintln!("unknown tool '{n}'"); return 1; }
-            cfg.disabled_tools.retain(|d| d != &n);
-            if a == "disable" { cfg.disabled_tools.push(n.clone()); }
-            if n == "fetch_url" && a == "enable" { cfg.allow_network = true; }
-            match cfg.save() { Ok(()) => { println!("{n}: {a}d"); 0 } Err(e) => { eprintln!("{e}"); 1 } }
+            let saved = Config::update(|c| {
+                c.disabled_tools.retain(|d| d != &n);
+                if a == "disable" { c.disabled_tools.push(n.clone()); }
+                if n == "fetch_url" && a == "enable" { c.allow_network = true; }
+                Ok(())
+            });
+            match saved { Ok(()) => { println!("{n}: {a}d"); 0 } Err(e) => { eprintln!("{e}"); 1 } }
         }
         _ => { eprintln!("usage: cortex tools [list | enable <name> | disable <name>]"); 2 }
     }
 }
 
-fn config_cmd(mut cfg: Config, action: Option<String>, key: Option<String>, value: Option<String>) -> i32 {
+/// Shows and changes the saved file, so it ignores this run's --model / --ctx overrides.
+fn config_cmd(action: Option<String>, key: Option<String>, value: Option<String>) -> i32 {
+    let cfg = Config::load();
     match (action.as_deref(), key, value) {
-        (None, _, _) | (Some("show"), _, _) => {
+        (None | Some("show"), _, _) => {
             println!("{}", ui::faint(&format!("# {}", config::config_path().display())));
             print!("{}", toml::to_string_pretty(&cfg).unwrap_or_default());
             0
         }
         (Some("get"), Some(k), _) => match cfg.get(&k) { Some(v) => { println!("{v}"); 0 } None => { eprintln!("unknown key '{k}'"); 1 } },
-        (Some("set"), Some(k), Some(v)) => match cfg.set(&k, &v).and_then(|_| cfg.save().map_err(|e| e.to_string())) {
+        (Some("set"), Some(k), Some(v)) => match Config::update(|c| c.set(&k, &v)) {
             Ok(()) => { println!("{k} = {v}"); 0 }
             Err(e) => { eprintln!("{e}"); 1 }
         },
@@ -554,14 +577,14 @@ fn sessions_cmd(action: &str, id: &str, yes: bool) -> i32 {
     match action {
         "list" | "ls" => { print_sessions(); 0 }
         "clear" => {
-            let n = agent::list_sessions().len();
+            let n = agent::session_ids().len();
             if n == 0 { println!("{}", ui::muted("no saved sessions")); return 0; }
-            if !yes && !ask(&format!("delete all {n} saved session{}? [y/N]", if n == 1 { "" } else { "s" }), "").eq_ignore_ascii_case("y") {
+            if !yes && !ask(&format!("delete all {}? [y/N]", ui::plural(n, "saved session")), "").eq_ignore_ascii_case("y") {
                 println!("{}", ui::muted("kept them"));
                 return 0;
             }
             match agent::delete_sessions(None) {
-                Ok(d) => { println!("{}", ui::muted(&format!("deleted {d} session{}", if d == 1 { "" } else { "s" }))); 0 }
+                Ok(d) => { println!("{}", ui::muted(&format!("deleted {}", ui::plural(d, "session")))); 0 }
                 Err(e) => { eprintln!("{}", ui::error(&e)); 1 }
             }
         }

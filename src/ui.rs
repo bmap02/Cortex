@@ -37,21 +37,41 @@ pub fn muted(s: &str) -> String { paint(s, MUTED, false) }
 pub fn faint(s: &str) -> String { paint(s, FAINT, false) }
 pub fn error(s: &str) -> String { paint(s, ERR, false) }
 
-/// Display width; everything we draw (ASCII, box drawing, braille, blocks) is 1 column.
-pub fn width(s: &str) -> usize { s.chars().count() }
+/// Columns a character takes on screen (2 for CJK and other wide characters).
+fn char_width(c: char) -> usize { unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) }
+
+/// Display width of plain text (no colour codes; see `width_of` for those).
+pub fn width(s: &str) -> usize { s.chars().map(char_width).sum() }
+
+/// Characters from `chars` while they fit in `budget` columns.
+fn fit(chars: impl Iterator<Item = char>, budget: usize) -> Vec<char> {
+    let mut used = 0;
+    chars.take_while(|&c| { used += char_width(c); used <= budget }).collect()
+}
 
 pub fn truncate(s: &str, max: usize) -> String {
     if width(s) <= max { return s.to_string(); }
-    let mut out: String = s.chars().take(max.saturating_sub(3)).collect();
-    out.push_str("...");
-    out
+    fit(s.chars(), max.saturating_sub(3)).into_iter().chain("...".chars()).collect()
 }
 
 /// Keep the end of a path: "…/projects/cortex".
 pub fn truncate_start(s: &str, max: usize) -> String {
-    let n = width(s);
-    if n <= max { return s.to_string(); }
-    format!("…{}", s.chars().skip(n - (max - 1)).collect::<String>())
+    if width(s) <= max { return s.to_string(); }
+    let tail = fit(s.chars().rev(), max.saturating_sub(1));
+    std::iter::once('…').chain(tail.into_iter().rev()).collect()
+}
+
+/// "1 session", "3 sessions".
+pub fn plural(n: usize, word: &str) -> String { format!("{n} {word}{}", if n == 1 { "" } else { "s" }) }
+
+/// Whether `c` is part of an ANSI escape sequence; `esc` carries the state between calls.
+fn in_escape(esc: &mut bool, c: char) -> bool {
+    if *esc {
+        if ('@'..='~').contains(&c) && c != '[' { *esc = false; }
+        return true;
+    }
+    if c == '\x1b' { *esc = true; return true; }
+    false
 }
 
 pub fn bar(frac: f64, cells: usize) -> String {
@@ -68,6 +88,9 @@ pub fn term_cols() -> usize {
 
 /// Status-line bullet: ● exists in every Windows console font, ◉ doesn't.
 pub const DOT: &str = "●";
+
+/// Marks a tool call. Not ⚙: many terminals draw that as a 2-column emoji over the next character.
+pub const TOOL_MARK: &str = "▸";
 
 // ---------------------------------------------------------------- banner
 const WORDMARK: [&str; 6] = [
@@ -192,14 +215,13 @@ static TRACK: std::sync::Mutex<Tracker> = std::sync::Mutex::new(Tracker { rows: 
 pub fn feed(s: &str) {
     let Ok(mut t) = TRACK.lock() else { return };
     for c in s.chars() {
-        if t.esc { if ('@'..='~').contains(&c) && c != '[' { t.esc = false; } continue; }
+        if in_escape(&mut t.esc, c) { continue; }
         match c {
-            '\x1b' => t.esc = true,
             '\n' => { t.rows += 1; t.col = 0; }
             '\r' => t.col = 0,
             '\t' => { let next = (t.col / 8 + 1) * 8; t.col = next.min(t.width); }
             _ => {
-                let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                let w = char_width(c);
                 if w == 0 { continue; }
                 if t.col + w > t.width { t.rows += 1; t.col = 0; }
                 t.col += w;
@@ -237,13 +259,8 @@ pub fn finish_header(model: &str, stats: &str) -> bool {
 
 /// Visible width of a string that may contain colour codes.
 pub fn width_of(s: &str) -> usize {
-    let mut w = 0; let mut esc = false;
-    for c in s.chars() {
-        if esc { if ('@'..='~').contains(&c) && c != '[' { esc = false; } continue; }
-        if c == '\x1b' { esc = true; continue; }
-        w += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-    }
-    w
+    let mut esc = false;
+    s.chars().filter(|&c| !in_escape(&mut esc, c)).map(char_width).sum()
 }
 
 /// Shown above each reply so it's clear who's talking.
@@ -259,6 +276,21 @@ pub fn status_line(ctx_used: usize, ctx_max: usize, tok_s: f64, steps: usize) ->
     let frac = if ctx_max > 0 { ctx_used as f64 / ctx_max as f64 } else { 0.0 };
     let mut s = muted(&format!("ctx {}/{} ", k(ctx_used), k(ctx_max))) + &muted("[") + &bar(frac, 10) + &muted("]") + &sep
         + &muted(&format!("{tok_s:.0} tok/s"));
-    if steps > 0 { s += &sep; s += &muted(&format!("{steps} tool call{}", if steps == 1 { "" } else { "s" })); }
+    if steps > 0 { s += &sep; s += &muted(&plural(steps, "tool call")); }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn widths_and_truncation() {
+        assert_eq!(width("日本"), 4);
+        assert_eq!(width_of("\x1b[1;38;2;255;255;255mhi\x1b[0m"), 2);
+        assert_eq!(truncate("hello world", 8), "hello...");
+        assert_eq!(truncate("日本語のテキスト", 9), "日本語...");
+        assert_eq!(truncate_start("/home/me/projects/cortex", 10), "…ts/cortex");
+        assert_eq!(plural(1, "session"), "1 session");
+        assert_eq!(plural(2, "session"), "2 sessions");
+    }
 }

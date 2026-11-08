@@ -37,6 +37,9 @@ pub struct Config {
     pub api_key_env: String,
     pub num_ctx: usize,
     pub temperature: f32,
+    /// Ollama "thinking" for models that support it: true, false, or unset (the model's default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
     /// Max tool-call rounds per message before the agent stops.
     pub max_steps: usize,
     /// Skip the y/n prompt before shell commands and file writes.
@@ -57,6 +60,7 @@ impl Default for Config {
             api_key_env: String::new(),
             num_ctx: 8192,
             temperature: 0.7,
+            think: None,
             max_steps: 12,
             auto_approve: false,
             allow_network: false,
@@ -131,6 +135,14 @@ impl Config {
         std::fs::write(config_path(), s)
     }
 
+    /// Change the saved settings. Works on a fresh copy of the file, so one-off overrides
+    /// for this run (`--model`, `--ctx`) are never written to it.
+    pub fn update(change: impl FnOnce(&mut Config) -> Result<(), String>) -> Result<(), String> {
+        let mut saved = Config::load();
+        change(&mut saved)?;
+        saved.save().map_err(|e| format!("couldn't save {}: {e}", config_path().display()))
+    }
+
     pub fn api_key(&self) -> Option<String> {
         if self.api_key_env.is_empty() { return None; }
         std::env::var(&self.api_key_env).ok().filter(|k| !k.is_empty())
@@ -153,6 +165,12 @@ impl Config {
             "api_key_env" => self.api_key_env = value.into(),
             "num_ctx" | "context" => self.num_ctx = parse_tokens(value)?,
             "temperature" => self.temperature = value.parse().map_err(|_| "temperature expects a number")?,
+            "think" => self.think = match value {
+                "true" | "on" => Some(true),
+                "false" | "off" => Some(false),
+                "auto" | "default" => None,
+                _ => return Err("think expects true, false or auto".into()),
+            },
             "max_steps" => self.max_steps = n(value)?,
             "auto_approve" => self.auto_approve = b(value)?,
             "allow_network" => self.allow_network = b(value)?,
@@ -163,6 +181,7 @@ impl Config {
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
+        if key == "think" && self.think.is_none() { return Some("auto".into()); }
         let v = toml::Value::try_from(self).ok()?;
         v.get(key).map(|x| match x {
             toml::Value::String(s) => s.clone(),

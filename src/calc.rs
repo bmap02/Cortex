@@ -36,7 +36,11 @@ impl Parser<'_> {
                 if d == 0.0 { return Err("division by zero".into()); }
                 v /= d;
             }
-            else if self.eat(b'%') { v %= self.unary()?; }
+            else if self.eat(b'%') {
+                let d = self.unary()?;
+                if d == 0.0 { return Err("modulo by zero".into()); }
+                v %= d;
+            }
             else { return Ok(v); }
         }
     }
@@ -107,5 +111,7 @@ mod tests {
         assert!((eval("sqrt(16) + log(1000)").unwrap() - 7.0).abs() < 1e-9);
         assert_eq!(eval("1_000 * 1.5e3").unwrap(), 1_500_000.0);
         assert!(eval("1/0").is_err());
+        assert!(eval("5 % 0").is_err());
+        assert_eq!(eval("7 % 3").unwrap(), 1.0);
     }
 }

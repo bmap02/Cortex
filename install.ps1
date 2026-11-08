@@ -4,6 +4,7 @@
 #   CORTEX_REPO         GitHub repo to download from (default below)
 #   CORTEX_VERSION      a tag like v0.1.0 (default: latest release)
 #   CORTEX_INSTALL_DIR  install folder (default: %LOCALAPPDATA%\Programs\cortex)
+#   CORTEX_RELEASES_URL download from a mirror instead of GitHub Releases
 
 # Everything runs inside a script block so that, under `irm | iex`, the preference
 # variables and helper variables below don't leak into the user's PowerShell session.
@@ -17,12 +18,10 @@
 
     # x64 build; Windows 11 on ARM runs it through built-in x64 emulation
     $Target = 'x86_64-pc-windows-msvc'
-    $Releases = "https://github.com/$Repo/releases"
-    if ($Version -eq 'latest') {
-        $Url = "$Releases/latest/download/cortex-$Target.zip"
-    } else {
-        $Url = "$Releases/download/$Version/cortex-$Target.zip"
-    }
+    $Releases = if ($env:CORTEX_RELEASES_URL) { $env:CORTEX_RELEASES_URL.TrimEnd('/') } else { "https://github.com/$Repo/releases" }
+    $Rel = if ($Version -eq 'latest') { "$Releases/latest/download" } else { "$Releases/download/$Version" }
+    $File = "cortex-$Target.zip"
+    $Url = "$Rel/$File"
 
     # TLS 1.2 is required by GitHub; add it for this install only and restore the setting afterwards
     $OldProtocol = [Net.ServicePointManager]::SecurityProtocol
@@ -32,9 +31,10 @@
             [Net.ServicePointManager]::SecurityProtocol = $OldProtocol -bor [Net.SecurityProtocolType]::Tls12
         }
         New-Item -ItemType Directory -Force $Tmp | Out-Null
+        $Zip = Join-Path $Tmp $File
         Write-Host "Downloading $Url"
         try {
-            Invoke-WebRequest -Uri $Url -OutFile (Join-Path $Tmp 'cortex.zip') -UseBasicParsing
+            Invoke-WebRequest -Uri $Url -OutFile $Zip -UseBasicParsing
         } catch {
             $ex = $_.Exception
             $status = $null
@@ -54,7 +54,29 @@
             Write-Host "  - Or build from source: download the repo and run install-windows.cmd"
             throw "Cortex was not installed."
         }
-        Expand-Archive -Path (Join-Path $Tmp 'cortex.zip') -DestinationPath $Tmp -Force
+
+        # Check the download against the release's SHA256SUMS.txt
+        $Expected = $null
+        try {
+            $Sums = Join-Path $Tmp 'SHA256SUMS.txt'
+            Invoke-WebRequest -Uri "$Rel/SHA256SUMS.txt" -OutFile $Sums -UseBasicParsing
+            foreach ($line in Get-Content $Sums) {
+                $parts = $line.Trim() -split '\s+', 2
+                if ($parts.Count -eq 2 -and $parts[1].TrimStart('*') -eq $File) { $Expected = $parts[0].ToLower() }
+            }
+        } catch { }
+        if (-not $Expected) {
+            Write-Host "Warning: no checksum found for $File; skipping verification." -ForegroundColor Yellow
+        } else {
+            $Actual = (Get-FileHash -Algorithm SHA256 -Path $Zip).Hash.ToLower()
+            if ($Actual -ne $Expected) {
+                Write-Host "Checksum mismatch for $File (expected $Expected, got $Actual)." -ForegroundColor Red
+                throw "The download may be corrupted or tampered with. Cortex was not installed."
+            }
+            Write-Host "Checksum OK"
+        }
+
+        Expand-Archive -Path $Zip -DestinationPath $Tmp -Force
         New-Item -ItemType Directory -Force $Dir | Out-Null
         $Exe = Join-Path $Dir 'cortex.exe'
         if (Test-Path $Exe) {

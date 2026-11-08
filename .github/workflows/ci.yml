@@ -6,6 +6,40 @@ on:
   pull_request:
 
 jobs:
+  # Run the install scripts from this commit against the latest published release
+  installers:
+    name: installers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          CORTEX_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
+          "$RUNNER_TEMP/bin/cortex" --version
+          # a version that doesn't exist must fail, not report success
+          if CORTEX_VERSION=v0.0.0-missing CORTEX_INSTALL_DIR="$RUNNER_TEMP/bin2" sh install.sh; then
+            echo "install.sh should have failed for a missing version"; exit 1
+          fi
+      - name: install.ps1 (Windows PowerShell, as with irm | iex)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:CORTEX_INSTALL_DIR = "$env:RUNNER_TEMP\cortex"
+          Get-Content -Raw .\install.ps1 | Invoke-Expression
+          & "$env:RUNNER_TEMP\cortex\cortex.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "cortex.exe didn't run" }
+          # a version that doesn't exist must throw, not report success
+          $env:CORTEX_VERSION = 'v0.0.0-missing'
+          $failed = $false
+          try { Get-Content -Raw .\install.ps1 | Invoke-Expression } catch { $failed = $true }
+          if (-not $failed) { throw "install.ps1 should have failed for a missing version" }
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -46,6 +46,7 @@ pub struct Usage {
     pub tok_per_s: f64,
 }
 
+#[derive(Default)]
 pub struct Reply {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
@@ -188,10 +189,19 @@ impl Backend {
     /// Stream a chat completion. `on_text` receives text as it arrives.
     pub fn chat(&self, cfg: &Config, model: &str, msgs: &[Msg], tools: &[Value], on_text: &mut dyn FnMut(&str)) -> Result<Reply, BackendError> {
         INTERRUPT.store(false, Ordering::SeqCst);
-        match self.kind {
-            BackendKind::Ollama => self.chat_ollama(cfg, model, msgs, tools, on_text),
-            BackendKind::Openai => self.chat_openai(cfg, model, msgs, tools, on_text),
+        // Some models now and then write a tool call the server can't parse; another sample usually works.
+        const ATTEMPTS: usize = 3;
+        for attempt in 1..=ATTEMPTS {
+            let result = match self.kind {
+                BackendKind::Ollama => self.chat_ollama(cfg, model, msgs, tools, on_text),
+                BackendKind::Openai => self.chat_openai(cfg, model, msgs, tools, on_text),
+            };
+            match result {
+                Err(BackendError::Other(m)) if attempt < ATTEMPTS && is_tool_parse_error(&m) && !INTERRUPT.load(Ordering::SeqCst) => continue,
+                other => return other,
+            }
         }
+        unreachable!("the last attempt always returns")
     }
 
     fn chat_ollama(&self, cfg: &Config, model: &str, msgs: &[Msg], tools: &[Value], on_text: &mut dyn FnMut(&str)) -> Result<Reply, BackendError> {
@@ -208,18 +218,20 @@ impl Backend {
             "options": {"num_ctx": cfg.num_ctx, "temperature": cfg.temperature},
         });
         if !tools.is_empty() { body["tools"] = json!(tools); }
+        if let Some(think) = cfg.think { body["think"] = json!(think); }
 
         let resp = self.req("POST", "/api/chat").send_json(body).map_err(Self::err)?;
-        let mut reply = Reply { content: String::new(), tool_calls: vec![], usage: Usage::default(), interrupted: false };
+        let mut reply = Reply::default();
+        let mut thinking = String::new();
         for line in BufReader::new(resp.into_reader()).lines() {
             if INTERRUPT.load(Ordering::SeqCst) { reply.interrupted = true; break; }
             let line = line.map_err(|e| BackendError::Other(e.to_string()))?;
             if line.trim().is_empty() { continue; }
             let v: Value = serde_json::from_str(&line).map_err(|e| BackendError::Other(format!("bad stream chunk: {e}")))?;
             if let Some(e) = v["error"].as_str() { return Err(BackendError::Other(e.into())); }
-            if let Some(t) = v["message"]["content"].as_str() {
-                if !t.is_empty() { on_text(t); reply.content.push_str(t); }
-            }
+            if let Some(t) = v["message"]["content"].as_str()
+                && !t.is_empty() { on_text(t); reply.content.push_str(t); }
+            if let Some(t) = v["message"]["thinking"].as_str() { thinking.push_str(t); }
             for c in v["message"]["tool_calls"].as_array().cloned().unwrap_or_default() {
                 let args = match &c["function"]["arguments"] {
                     Value::String(s) => serde_json::from_str(s).unwrap_or(json!({})),
@@ -241,6 +253,7 @@ impl Backend {
                 };
             }
         }
+        reply.use_thinking_if_empty(&thinking, on_text);
         Ok(reply)
     }
 
@@ -266,10 +279,11 @@ impl Backend {
         let start = Instant::now();
         let mut first_token: Option<Instant> = None;
         let resp = self.req("POST", "/chat/completions").send_json(body).map_err(Self::err)?;
-        let mut reply = Reply { content: String::new(), tool_calls: vec![], usage: Usage::default(), interrupted: false };
+        let mut reply = Reply::default();
         // tool call fragments arrive spread over many chunks, keyed by index
         let mut partial: Vec<(String, String, String)> = vec![]; // (id, name, args json text)
         let mut streamed_chunks = 0usize;
+        let mut thinking = String::new();
 
         for line in BufReader::new(resp.into_reader()).lines() {
             if INTERRUPT.load(Ordering::SeqCst) { reply.interrupted = true; break; }
@@ -284,14 +298,15 @@ impl Backend {
                 reply.usage.completion_tokens = u["completion_tokens"].as_u64().unwrap_or(0) as usize;
             }
             let delta = &v["choices"][0]["delta"];
-            if let Some(t) = delta["content"].as_str() {
-                if !t.is_empty() {
+            if let Some(t) = delta["content"].as_str()
+                && !t.is_empty() {
                     first_token.get_or_insert_with(Instant::now);
                     streamed_chunks += 1;
                     on_text(t);
                     reply.content.push_str(t);
                 }
-            }
+            // llama.cpp, vLLM and LM Studio stream reasoning in one of these fields
+            if let Some(t) = delta["reasoning_content"].as_str().or(delta["reasoning"].as_str()) { thinking.push_str(t); }
             for tc in delta["tool_calls"].as_array().cloned().unwrap_or_default() {
                 let i = tc["index"].as_u64().unwrap_or(partial.len() as u64) as usize;
                 while partial.len() <= i { partial.push(Default::default()); }
@@ -311,6 +326,51 @@ impl Backend {
         let gen_secs = first_token.map(|t| t.elapsed()).unwrap_or_else(|| start.elapsed()).as_secs_f64();
         let toks = if reply.usage.completion_tokens > 0 { reply.usage.completion_tokens } else { streamed_chunks };
         reply.usage.tok_per_s = if gen_secs > 0.0 { toks as f64 / gen_secs } else { 0.0 };
+        reply.use_thinking_if_empty(&thinking, on_text);
         Ok(reply)
+    }
+}
+
+/// The server rejected the model's tool call as malformed (e.g. Ollama's
+/// "XML syntax error ... element <function> closed by </parameter>").
+fn is_tool_parse_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("xml syntax error") || (m.contains("tool call") && (m.contains("parse") || m.contains("invalid")))
+}
+
+impl Reply {
+    /// Some models (or their Ollama templates) put the whole answer in the thinking/reasoning
+    /// channel and leave the reply empty. Show that text as the answer rather than nothing.
+    fn use_thinking_if_empty(&mut self, thinking: &str, on_text: &mut dyn FnMut(&str)) {
+        let t = thinking.trim();
+        if self.content.trim().is_empty() && self.tool_calls.is_empty() && !self.interrupted && !t.is_empty() {
+            on_text(t);
+            self.content = t.to_string();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recognizes_malformed_tool_calls() {
+        assert!(is_tool_parse_error("server returned 500: XML syntax error on line 7: element <function> closed by </parameter>"));
+        assert!(is_tool_parse_error("error parsing tool call: invalid JSON"));
+        assert!(!is_tool_parse_error("can't reach the server: connection refused"));
+    }
+    #[test]
+    fn empty_reply_falls_back_to_thinking() {
+        let mut shown = String::new();
+        let mut r = Reply::default();
+        r.use_thinking_if_empty("  Here are the files.\n", &mut |t| shown.push_str(t));
+        assert_eq!((r.content.as_str(), shown.as_str()), ("Here are the files.", "Here are the files."));
+        // a real answer, or a tool call, wins over thinking
+        let mut r = Reply { content: "answer".into(), ..Reply::default() };
+        r.use_thinking_if_empty("reasoning", &mut |_| {});
+        assert_eq!(r.content, "answer");
+        let mut r = Reply { tool_calls: vec![ToolCall { id: "1".into(), name: "list_dir".into(), args: json!({}) }], ..Reply::default() };
+        r.use_thinking_if_empty("reasoning", &mut |_| {});
+        assert!(r.content.is_empty());
     }
 }
