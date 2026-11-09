@@ -84,6 +84,8 @@ enum Cmd {
     Doctor,
     /// Update Cortex to the latest release
     Update,
+    /// Remove Cortex from this computer (asks before deleting your settings and conversations)
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -118,6 +120,7 @@ fn main() {
         Cmd::Sessions { action, id, yes } => sessions_cmd(action.as_deref().unwrap_or("list"), id.as_deref().unwrap_or(""), yes),
         Cmd::Doctor => doctor(&cfg),
         Cmd::Update => update(),
+        Cmd::Uninstall => uninstall(),
     };
     std::process::exit(code);
 }
@@ -679,6 +682,70 @@ fn update() -> i32 {
     }
 }
 
+/// `cortex uninstall`: removes the cortex binary that's running (wherever it was installed) and,
+/// only if you say so, the settings folder with your memory and saved conversations.
+fn uninstall() -> i32 {
+    let Some(exe) = std::env::current_exe().ok() else { eprintln!("{}", ui::error("couldn't find the cortex program")); return 1 };
+    let dir = exe.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    println!("This removes Cortex: {}", exe.display());
+    if !ask("Continue? [y/N]", "").eq_ignore_ascii_case("y") {
+        println!("{}", ui::muted("nothing removed"));
+        return 0;
+    }
+    let home = config::home();
+    if home.exists() {
+        let q = format!("Also delete your settings, memory and saved conversations in {}? [y/N]", home.display());
+        if ask(&q, "").eq_ignore_ascii_case("y") {
+            match std::fs::remove_dir_all(&home) {
+                Ok(()) => println!("{}", ui::muted(&format!("deleted {}", home.display()))),
+                Err(e) => eprintln!("{}", ui::error(&format!("couldn't delete {}: {e}", home.display()))),
+            }
+        } else {
+            println!("{}", ui::muted(&format!("kept {}", home.display())));
+        }
+    }
+    if cfg!(windows) {
+        // Windows can't delete a running .exe, so a hidden helper deletes it once Cortex has exited
+        let installer_dir = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Programs").join("cortex"));
+        let script = windows_cleanup_script(&exe, &dir, installer_dir.as_deref() == Some(dir.as_path()));
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        { use std::os::windows::process::CommandExt; cmd.creation_flags(0x0800_0000); } // CREATE_NO_WINDOW
+        if let Err(e) = cmd.spawn() {
+            eprintln!("{}", ui::error(&format!("couldn't remove {}: {e}. Delete it by hand.", exe.display())));
+            return 1;
+        }
+    } else if let Err(e) = std::fs::remove_file(&exe) {
+        eprintln!("{}", ui::error(&format!("couldn't remove {}: {e}", exe.display())));
+        return 1;
+    }
+    println!("{}", ui::bold("Cortex is uninstalled.")); // on Windows the file disappears a moment after this exits
+    println!("{}", ui::faint("  Reinstall any time with the install command from the README."));
+    0
+}
+
+/// PowerShell that deletes `exe` once it's no longer running, plus leftovers from `cortex update`.
+/// For the installer's own folder it also removes the folder and takes it off the user PATH again.
+fn windows_cleanup_script(exe: &std::path::Path, dir: &std::path::Path, installer_dir: bool) -> String {
+    let q = |p: &std::path::Path| p.display().to_string().replace('\'', "''"); // PowerShell single-quote escaping
+    let mut s = format!(
+        "$exe = '{}'; $dir = '{}'\n\
+         for ($i = 0; $i -lt 50 -and (Test-Path -LiteralPath $exe); $i++) {{ Start-Sleep -Milliseconds 200; Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue }}\n\
+         Get-ChildItem -LiteralPath $dir -Filter 'cortex.exe*.old' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue\n",
+        q(exe), q(dir));
+    if installer_dir {
+        s += "Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue\n\
+              $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)\n\
+              $p = $k.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)\n\
+              if ($p) { $kind = $k.GetValueKind('Path'); $keep = @($p -split ';' | Where-Object { $_ -and [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\\') -ne $dir.TrimEnd('\\') }); $k.SetValue('Path', ($keep -join ';'), $kind) }\n\
+              $k.Close()\n\
+              [Environment]::SetEnvironmentVariable('CORTEX_PATH_REFRESH', '1', 'User'); [Environment]::SetEnvironmentVariable('CORTEX_PATH_REFRESH', $null, 'User')\n";
+    }
+    s
+}
+
 fn doctor(cfg: &Config) -> i32 {
     let ok = |s: &str| println!("  {} {s}", ui::bold("✓"));
     let bad = |s: &str| println!("  {} {s}", ui::error("✗"));
@@ -711,7 +778,17 @@ fn doctor(cfg: &Config) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{repo, version_parts};
+    use super::{repo, version_parts, windows_cleanup_script};
+    use std::path::Path;
+
+    #[test]
+    fn uninstall_script_quotes_paths_and_only_touches_path_for_the_installer_folder() {
+        let s = windows_cleanup_script(Path::new(r"C:\Users\o'neil\.cargo\bin\cortex.exe"), Path::new(r"C:\Users\o'neil\.cargo\bin"), false);
+        assert!(s.contains(r"$exe = 'C:\Users\o''neil\.cargo\bin\cortex.exe'"), "a ' in a path is escaped: {s}");
+        assert!(!s.contains("Registry"), "a cargo install leaves PATH alone");
+        let s = windows_cleanup_script(Path::new(r"C:\x\Programs\cortex\cortex.exe"), Path::new(r"C:\x\Programs\cortex"), true);
+        assert!(s.contains("Registry") && s.contains("-Recurse"), "the installer folder is removed and taken off PATH");
+    }
 
     #[test]
     fn versions_compare_as_numbers() {

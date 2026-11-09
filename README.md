@@ -181,7 +181,11 @@ release build in place. To keep building from source instead, get the new source
 `git pull` before `cargo install --path .`, or download a fresh ZIP before running
 `install-windows.cmd` (note that it also re-applies its Ollama settings to your config).
 
-To uninstall, delete the binary and the settings folder:
+To uninstall, run `cortex uninstall` (v0.1.2 and later). It removes the `cortex` you're running and
+asks separately before deleting your settings, memory and saved conversations in `~/.cortex`. When
+Cortex was installed with the install script on Windows, it also takes its folder off your PATH again.
+
+Or remove it by hand: delete the binary and the settings folder.
 
 ```powershell
 # Windows
@@ -262,6 +266,7 @@ cortex sessions                 # list saved sessions
 cortex sessions delete <id>     # remove one
 cortex sessions clear           # remove all (asks first; -y to skip)
 cortex update                   # update to the latest release
+cortex uninstall                # remove Cortex (asks before deleting your data)
 ```
 
 In `run` mode with piped input, nobody is at the keyboard to approve changes, so the tools that
