@@ -2,7 +2,8 @@
 
 Scripted behaviour: if the last message is from the user, ask for a tool call
 (calculator for math questions, write_file when asked to write a file); after a
-tool result comes back, stream a final answer that quotes the result.
+tool result comes back, stream a final answer that quotes the result. A prompt
+containing "loop" repeats the same calculator call until Cortex refuses to rerun it.
 """
 import json, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 def decide(messages):
     last = messages[-1]
     if last["role"] == "tool":
+        asked = next(m["content"].lower() for m in reversed(messages) if m["role"] == "user")
+        # "loop": behave like a small model that repeats the exact same call instead of answering
+        if "loop" in asked and not last["content"].startswith("Not run again"):
+            return ("tool", "calculator", {"expression": "1234 * 5678"})
         return ("text", f"Done. The tool said: {last['content'].strip()}")
     text = last["content"].lower()
     if "long" in text:

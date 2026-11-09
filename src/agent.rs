@@ -198,6 +198,11 @@ impl Agent {
     fn run_loop(&mut self, quiet: bool) -> Result<String, String> {
         let mut tool_calls_made = 0;
         let mut final_text = String::new();
+        // Small models sometimes repeat the exact call they just made instead of using its result.
+        // An identical call right after itself isn't run again (re-running tests after an edit is
+        // still fine: the edit comes in between); two such steps in a row end the turn.
+        let mut prev_calls: Vec<(String, String)> = vec![];
+        let mut repeat_steps = 0;
         if !quiet { println!("\n{}", ui::reply_header(&self.model)); ui::track_start(); }
         for step in 0..self.cfg.max_steps.max(1) {
             if self.ctx_used() > self.cfg.num_ctx * 85 / 100 && self.msgs.len() > 6 {
@@ -226,7 +231,8 @@ impl Agent {
                 Err(e) => { self.msgs.pop_if_user(); return Err(e.to_string()); }
             };
             if !reply.content.is_empty() { ui::out("\n"); }
-            self.last = reply.usage;
+            // a stopped reply never gets its token counts; keep the last real ones for the stats line
+            if reply.usage.prompt_tokens + reply.usage.completion_tokens > 0 { self.last = reply.usage; }
             self.total_prompt += reply.usage.prompt_tokens;
             self.total_completion += reply.usage.completion_tokens;
 
@@ -244,14 +250,22 @@ impl Agent {
             if reply.tool_calls.is_empty() { break; }
 
             let mut declined = false;
+            let this_step: Vec<(String, String)> = reply.tool_calls.iter().map(|c| (c.name.clone(), c.args.to_string())).collect();
+            let mut only_repeats = true;
             for call in &reply.tool_calls {
                 if declined {
                     // every tool call needs a result; skip the rest after a "no"
                     self.msgs.push(Msg::tool_result(call, "Skipped: the user declined an earlier action in this step.".into()));
                     continue;
                 }
-                tool_calls_made += 1;
                 let desc = tools::describe(&call.name, &call.args);
+                if prev_calls.contains(&(call.name.clone(), call.args.to_string())) {
+                    if !quiet { ui::outln(&format!("  {} {}", ui::paint(ui::TOOL_MARK, ui::WHITE, true), ui::faint(&ui::truncate(&format!("{}: {desc}  (skipped: same as the previous step)", call.name), 110)))); }
+                    self.msgs.push(Msg::tool_result(call, REPEAT_NOTE.into()));
+                    continue;
+                }
+                only_repeats = false;
+                tool_calls_made += 1;
                 if !quiet { ui::outln(&format!("  {} {}", ui::paint(ui::TOOL_MARK, ui::WHITE, true), ui::muted(&ui::truncate(&format!("{}: {desc}", call.name), 110)))); }
                 let tool = tools::find(&call.name);
                 let result = match &tool {
@@ -275,6 +289,12 @@ impl Agent {
             if declined {
                 // hand control back to the user instead of letting the model try something else
                 ui::outln(&ui::faint("  (stopped: tell Cortex what you'd like instead)"));
+                break;
+            }
+            prev_calls = this_step;
+            repeat_steps = if only_repeats { repeat_steps + 1 } else { 0 };
+            if repeat_steps >= 2 {
+                ui::outln(&ui::faint("  (stopped: the model kept repeating the same action)"));
                 break;
             }
             if step + 1 == self.cfg.max_steps {
@@ -319,6 +339,10 @@ impl Agent {
         Some(text)
     }
 }
+
+/// Sent back instead of running a tool call identical to the one in the previous step.
+const REPEAT_NOTE: &str = "Not run again: this is exactly the same call as your previous step, and its result is above. \
+Use that result to continue, or answer the user now.";
 
 /// Index where compression splits the conversation: messages before the latest user turn are
 /// summarized, the rest is kept. With no earlier turn to keep apart, everything is summarized.

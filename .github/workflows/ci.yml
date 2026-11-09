@@ -86,6 +86,10 @@ jobs:
           out=$($BIN run -q "what is 1234 * 5678?" < /dev/null)
           echo "$out"
           echo "$out" | grep -q 7006652
+          # a model that repeats its exact previous call gets "Not run again" instead of a second run
+          out=$($BIN run -q "loop: what is 1234 * 5678?" < /dev/null)
+          echo "$out"
+          echo "$out" | grep -q "Not run again"
           $BIN config set backend openai
           $BIN config set base_url http://127.0.0.1:11999/v1
           $BIN config set model mock-7b
