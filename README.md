@@ -11,6 +11,10 @@ A lightweight AI agent for your terminal that runs entirely on your machine, on
 Windows, macOS and Linux. It is a single ~5 MB Rust binary with no telemetry, and it talks to **Ollama** or
 **any OpenAI-compatible server** (llama.cpp, LM Studio, vLLM, LocalAI, Jan).
 
+<p align="center">
+  <img src="assets/demo.svg" alt="Animation: a terminal opens on a desktop, cortex is typed and the Cortex banner appears" width="100%">
+</p>
+
 - **Streaming chat** with history, multi-line input and Tab-completed `/commands`
 - **Markdown rendering** as replies stream in: headings, bold, italics, strikethrough, clickable links,
   lists, quotes and syntax-highlighted code blocks that copy cleanly (piped output and `NO_COLOR=1`
@@ -324,8 +328,7 @@ src/markdown.rs  streaming Markdown rendering for replies
 tests/mock_server.py   fake Ollama/OpenAI server for testing without a model
 install.sh / install.ps1   one-line installers (download a release)
 install-windows.cmd/.ps1   all-in-one Windows installer (builds from source)
-.github/workflows/     CI on Windows, macOS & Linux; release builds on version tags
-```
+.github/workflows/     CI on Windows, macOS & Linux; release builds on version tags```
 
 Run the tests with `cargo test`. For an end-to-end check without a GPU, start
 `python3 tests/mock_server.py 11999` and point Cortex at `http://127.0.0.1:11999` (Ollama) or
