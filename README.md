@@ -174,8 +174,10 @@ cortex           # start chatting
 
 ### Updating and uninstalling
 
-Run the install command again to update; it works even while Cortex is open. If you built from
-source, get the new source first: run `cargo install --git https://github.com/bmap02/Cortex` again,
+Run `cortex update` (v0.1.2 and later) to get the latest release, or run the install command again.
+Both work even while Cortex is open. `cortex update` checks GitHub for a newer release, then runs the
+installer for the folder the current `cortex` is in, so a `cargo install` build is replaced by the
+release build in place. To keep building from source instead, get the new source first: run `cargo install --git https://github.com/bmap02/Cortex` again,
 `git pull` before `cargo install --path .`, or download a fresh ZIP before running
 `install-windows.cmd` (note that it also re-applies its Ollama settings to your config).
 
@@ -259,6 +261,7 @@ cortex config                   # show settings; cortex config set num_ctx 16384
 cortex sessions                 # list saved sessions
 cortex sessions delete <id>     # remove one
 cortex sessions clear           # remove all (asks first; -y to skip)
+cortex update                   # update to the latest release
 ```
 
 In `run` mode with piped input, nobody is at the keyboard to approve changes, so the tools that

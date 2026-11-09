@@ -82,6 +82,8 @@ enum Cmd {
     },
     /// Check that the server, model and tool calling work
     Doctor,
+    /// Update Cortex to the latest release
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -115,6 +117,7 @@ fn main() {
         Cmd::Config { action, key, value } => config_cmd(action, key, value),
         Cmd::Sessions { action, id, yes } => sessions_cmd(action.as_deref().unwrap_or("list"), id.as_deref().unwrap_or(""), yes),
         Cmd::Doctor => doctor(&cfg),
+        Cmd::Update => update(),
     };
     std::process::exit(code);
 }
@@ -626,6 +629,56 @@ fn print_sessions() {
     }
 }
 
+/// "owner/name" of the GitHub repo, from Cargo.toml's `repository`.
+fn repo() -> &'static str { env!("CARGO_PKG_REPOSITORY").trim_start_matches("https://github.com/") }
+
+/// "0.1.10" -> [0, 1, 10], so versions compare as numbers ("0.1.10" is newer than "0.1.9").
+fn version_parts(v: &str) -> Vec<u64> {
+    v.trim().trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect()
+}
+
+/// `cortex update`: if a newer release exists, run the official installer (it downloads the
+/// release, checks it against SHA256SUMS.txt and swaps the binary, even while Cortex is running).
+fn update() -> i32 {
+    let current = env!("CARGO_PKG_VERSION");
+    let latest = ureq::get(&format!("https://api.github.com/repos/{}/releases/latest", repo()))
+        .set("User-Agent", &format!("cortex/{current}")) // GitHub's API requires one
+        .timeout(std::time::Duration::from_secs(15))
+        .call().ok()
+        .and_then(|r| r.into_json::<serde_json::Value>().ok())
+        .and_then(|v| v["tag_name"].as_str().map(String::from));
+    let Some(latest) = latest else {
+        eprintln!("{}", ui::error("couldn't check for updates (no internet connection, or GitHub is unreachable)"));
+        return 1;
+    };
+    if version_parts(&latest) <= version_parts(current) {
+        println!("{}", ui::muted(&format!("Cortex v{current} is up to date (latest release: {latest}).")));
+        return 0;
+    }
+    println!("{}", ui::bold(&format!("Updating Cortex v{current} → {latest}")));
+
+    // install into the folder this cortex runs from, so the one on your PATH is the one replaced
+    // (e.g. ~/.cargo/bin for `cargo install` builds, not the installer's default folder)
+    let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let script = format!("https://raw.githubusercontent.com/{}/main/install", repo());
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("powershell");
+        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &format!("irm {script}.ps1 | iex")]);
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", &format!("curl -fsSL {script}.sh | sh")]);
+        c
+    };
+    if let Some(d) = &dir { cmd.env("CORTEX_INSTALL_DIR", d); }
+    cmd.env("CORTEX_REPO", repo());
+    match cmd.status() {
+        Ok(s) if s.success() => { println!("{}", ui::bold(&format!("Updated to {latest}."))); 0 }
+        Ok(s) => { eprintln!("{}", ui::error(&format!("update failed (installer exit code {})", s.code().unwrap_or(-1)))); 1 }
+        Err(e) => { eprintln!("{}", ui::error(&format!("couldn't run the installer: {e}"))); 1 }
+    }
+}
+
 fn doctor(cfg: &Config) -> i32 {
     let ok = |s: &str| println!("  {} {s}", ui::bold("✓"));
     let bad = |s: &str| println!("  {} {s}", ui::error("✗"));
@@ -654,4 +707,19 @@ fn doctor(cfg: &Config) -> i32 {
     ok(&format!("shell for run_shell: {}", tools::shell_name()));
     if tools::python_available() { ok("python available for run_python") } else { bad("python not found: run_python won't work") }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{repo, version_parts};
+
+    #[test]
+    fn versions_compare_as_numbers() {
+        assert!(version_parts("v0.1.2") > version_parts("0.1.1"));
+        assert!(version_parts("v0.1.10") > version_parts("0.1.9")); // not alphabetical
+        assert!(version_parts("v0.2.0") > version_parts("0.1.99"));
+        assert!(version_parts("v0.1.1") <= version_parts("0.1.1")); // same version: no update
+        assert!(version_parts("v0.1.1") <= version_parts("0.2.0")); // a newer dev build isn't downgraded
+        assert_eq!(repo(), "bmap02/Cortex");
+    }
 }
