@@ -686,7 +686,6 @@ fn update() -> i32 {
 /// only if you say so, the settings folder with your memory and saved conversations.
 fn uninstall() -> i32 {
     let Some(exe) = std::env::current_exe().ok() else { eprintln!("{}", ui::error("couldn't find the cortex program")); return 1 };
-    let dir = exe.parent().map(|d| d.to_path_buf()).unwrap_or_default();
     println!("This removes Cortex: {}", exe.display());
     if !ask("Continue? [y/N]", "").eq_ignore_ascii_case("y") {
         println!("{}", ui::muted("nothing removed"));
@@ -704,26 +703,68 @@ fn uninstall() -> i32 {
             println!("{}", ui::muted(&format!("kept {}", home.display())));
         }
     }
-    if cfg!(windows) {
-        // Windows can't delete a running .exe, so a hidden helper deletes it once Cortex has exited
-        let installer_dir = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Programs").join("cortex"));
-        let script = windows_cleanup_script(&exe, &dir, installer_dir.as_deref() == Some(dir.as_path()));
-        let mut cmd = std::process::Command::new("powershell");
-        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        { use std::os::windows::process::CommandExt; cmd.creation_flags(0x0800_0000); } // CREATE_NO_WINDOW
-        if let Err(e) = cmd.spawn() {
-            eprintln!("{}", ui::error(&format!("couldn't remove {}: {e}. Delete it by hand.", exe.display())));
-            return 1;
-        }
-    } else if let Err(e) = std::fs::remove_file(&exe) {
-        eprintln!("{}", ui::error(&format!("couldn't remove {}: {e}", exe.display())));
+    // look before removing: afterwards a copy found on PATH could be this one
+    let others = other_copies(&exe);
+    if let Err(e) = remove_program(&exe) {
+        eprintln!("{}", ui::error(&e));
         return 1;
     }
-    println!("{}", ui::bold("Cortex is uninstalled.")); // on Windows the file disappears a moment after this exits
+    // e.g. an old install-script copy hidden behind a `cargo install` build: it would answer to `cortex` next
+    if !others.is_empty() {
+        println!("{}", ui::bold("Other copies of Cortex are still on your PATH:"));
+        for p in &others {
+            let version = std::process::Command::new(p).arg("--version").output().ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "unknown version".into());
+            println!("  {}  {}", p.display(), ui::faint(&format!("({version})")));
+        }
+        if ask("Remove them too? [y/N]", "").eq_ignore_ascii_case("y") {
+            for p in &others {
+                if let Err(e) = remove_program(p) { eprintln!("{}", ui::error(&e)); }
+            }
+        } else {
+            println!("{}", ui::muted(&format!("kept them; `cortex` now runs {}", others[0].display())));
+        }
+    }
+    println!("{}", ui::bold("Cortex is uninstalled.")); // on Windows the files disappear a moment after this exits
     println!("{}", ui::faint("  Reinstall any time with the install command from the README."));
     0
+}
+
+/// Every other `cortex` program on PATH besides `exe`, in PATH order (the first one is what
+/// `cortex` runs next).
+fn other_copies(exe: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let name = if cfg!(windows) { "cortex.exe" } else { "cortex" };
+    // compare resolved paths (the same folder can be on PATH twice, spelled differently),
+    // but hand back the normal ones (Windows resolves to \\?\C:\... form)
+    let real = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let (mut seen, mut copies) = (vec![real(exe)], vec![]);
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let p = dir.join(name);
+        if p.is_file() && !seen.contains(&real(&p)) {
+            seen.push(real(&p));
+            copies.push(p);
+        }
+    }
+    copies
+}
+
+/// Delete a cortex program. On Windows a hidden helper does it once that program isn't running
+/// (a running .exe can't be deleted), and also cleans up after the installer's own folder.
+fn remove_program(exe: &std::path::Path) -> Result<(), String> {
+    if !cfg!(windows) {
+        return std::fs::remove_file(exe).map_err(|e| format!("couldn't remove {}: {e}", exe.display()));
+    }
+    let dir = exe.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    let installer_dir = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Programs").join("cortex"));
+    let is_installer_dir = installer_dir.and_then(|d| d.canonicalize().ok()) == dir.canonicalize().ok();
+    let script = windows_cleanup_script(exe, &dir, is_installer_dir);
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; cmd.creation_flags(0x0800_0000); } // CREATE_NO_WINDOW
+    cmd.spawn().map(|_| ()).map_err(|e| format!("couldn't remove {}: {e}. Delete it by hand.", exe.display()))
 }
 
 /// PowerShell that deletes `exe` once it's no longer running, plus leftovers from `cortex update`.
