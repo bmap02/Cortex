@@ -120,12 +120,19 @@ impl Config {
     pub fn exists() -> bool { config_path().exists() }
 
     pub fn load() -> Config {
-        match std::fs::read_to_string(config_path()) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("warning: couldn't parse {}: {e}. Using defaults.", config_path().display());
-                Config::default()
-            }),
-            Err(_) => Config::default(),
+        Config::read_from(&config_path()).unwrap_or_else(|e| {
+            eprintln!("warning: {e}. Using defaults.");
+            Config::default()
+        })
+    }
+
+    /// The settings saved at `path` (defaults if there's no file). A file that exists but
+    /// can't be read is an error, so nothing overwrites it with defaults.
+    fn read_from(path: &std::path::Path) -> Result<Config, String> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => toml::from_str(&s).map_err(|e| format!("couldn't parse {}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) => Err(format!("couldn't read {}: {e}", path.display())),
         }
     }
 
@@ -138,7 +145,7 @@ impl Config {
     /// Change the saved settings. Works on a fresh copy of the file, so one-off overrides
     /// for this run (`--model`, `--ctx`) are never written to it.
     pub fn update(change: impl FnOnce(&mut Config) -> Result<(), String>) -> Result<(), String> {
-        let mut saved = Config::load();
+        let mut saved = Config::read_from(&config_path()).map_err(|e| format!("{e}; fix or delete it before changing settings"))?;
         change(&mut saved)?;
         saved.save().map_err(|e| format!("couldn't save {}: {e}", config_path().display()))
     }
@@ -187,5 +194,26 @@ impl Config {
             toml::Value::String(s) => s.clone(),
             other => other.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn unreadable_config_is_an_error_not_defaults() {
+        let dir = std::env::temp_dir().join(format!("cortex_cfg{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // no file yet: defaults
+        assert_eq!(Config::read_from(&path).unwrap().num_ctx, Config::default().num_ctx);
+        // a valid file is read
+        std::fs::write(&path, "num_ctx = 16384\n").unwrap();
+        assert_eq!(Config::read_from(&path).unwrap().num_ctx, 16384);
+        // a typo is reported, so update() won't replace the file with defaults
+        std::fs::write(&path, "num_ctx = \n").unwrap();
+        assert!(Config::read_from(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

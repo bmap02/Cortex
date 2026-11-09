@@ -63,6 +63,12 @@ pub fn truncate_start(s: &str, max: usize) -> String {
     std::iter::once('…').chain(tail.into_iter().rev()).collect()
 }
 
+/// Text Cortex didn't write (model replies, tool output, file contents) without escape codes and
+/// other control characters, so it can't restyle, hide or command the terminal. Keeps line breaks and tabs.
+pub fn clean(s: &str) -> String {
+    s.chars().filter(|&c| !c.is_control() || c == '\n' || c == '\t').collect()
+}
+
 /// "1 session", "3 sessions".
 pub fn plural(n: usize, word: &str) -> String { format!("{n} {word}{}", if n == 1 { "" } else { "s" }) }
 
@@ -305,5 +311,8 @@ mod tests {
         assert_eq!(truncate_start("/home/me/projects/cortex", 10), "…ts/cortex");
         assert_eq!(plural(1, "session"), "1 session");
         assert_eq!(plural(2, "session"), "2 sessions");
+        // conceal (ESC[8m), clipboard (OSC 52 ... BEL), the 8-bit CSI and a carriage return are all dropped
+        assert_eq!(clean("echo hi\x1b[8m; rm -rf ~\x1b]52;c;ZXZpbA==\x07 \u{9b}2J\r\nnext\tline"),
+            "echo hi[8m; rm -rf ~]52;c;ZXZpbA== 2J\nnext\tline");
     }
 }

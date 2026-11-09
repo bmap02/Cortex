@@ -26,6 +26,20 @@ pub fn new_session_id() -> String {
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
+/// An id for a new session that no saved session uses yet: `cortex run` started twice in the
+/// same second would otherwise save over the first conversation.
+/// shortcut: two Cortex windows starting in the same second can still pick the same id (neither
+/// has saved yet); claim the file at creation if that ever matters.
+fn fresh_session_id() -> String {
+    first_free(&new_session_id(), |id| config::sessions_dir().join(format!("{id}.json")).exists())
+}
+
+/// `base`, or `base-2`, `base-3`, ... whichever isn't taken.
+fn first_free(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(base) { return base.to_string(); }
+    (2..).map(|n| format!("{base}-{n}")).find(|id| !taken(id)).expect("some suffix is free")
+}
+
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = z.div_euclid(146097);
@@ -58,10 +72,16 @@ pub fn session_ids() -> Vec<String> {
     ids
 }
 
-/// Delete saved sessions: all of them (None) or the one whose id starts with `prefix`.
+/// Ids for what the user typed: just that id if it exists (so `…-848` doesn't also mean
+/// `…-848-2`), otherwise every id starting with it, newest first.
+fn matching(ids: Vec<String>, typed: &str) -> Vec<String> {
+    if ids.iter().any(|id| id == typed) { return vec![typed.to_string()]; }
+    ids.into_iter().filter(|id| id.starts_with(typed)).collect()
+}
+
+/// Delete saved sessions: all of them (None) or the one matching `prefix`.
 pub fn delete_sessions(prefix: Option<&str>) -> Result<usize, String> {
-    let ids: Vec<String> = session_ids().into_iter()
-        .filter(|id| prefix.is_none_or(|p| id.starts_with(p))).collect();
+    let ids = match prefix { Some(p) => matching(session_ids(), p), None => session_ids() };
     if let Some(p) = prefix {
         if ids.is_empty() { return Err(format!("no session matches '{p}'")); }
         if ids.len() > 1 { return Err(format!("'{p}' matches {} sessions; use more of the id", ids.len())); }
@@ -73,9 +93,9 @@ pub fn delete_sessions(prefix: Option<&str>) -> Result<usize, String> {
     Ok(n)
 }
 
-/// The newest readable session whose id starts with `prefix` ("" = the latest one).
+/// The session with id `prefix`, else the newest readable one whose id starts with it ("" = the latest).
 pub fn load_session(prefix: &str) -> Option<Session> {
-    session_ids().into_iter().filter(|id| id.starts_with(prefix)).find_map(|id| {
+    matching(session_ids(), prefix).into_iter().find_map(|id| {
         serde_json::from_str(&std::fs::read_to_string(config::sessions_dir().join(format!("{id}.json"))).ok()?).ok()
     })
 }
@@ -124,7 +144,7 @@ impl Agent {
         Agent {
             model: cfg.model.clone(),
             msgs: vec![Msg::new("system", system_prompt(&cfg))],
-            session_id: new_session_id(),
+            session_id: fresh_session_id(),
             created: now(),
             approve_all: cfg.auto_approve,
             tools_supported: true,
@@ -138,7 +158,7 @@ impl Agent {
 
     pub fn reset(&mut self) {
         self.msgs = vec![Msg::new("system", system_prompt(&self.cfg))];
-        self.session_id = new_session_id();
+        self.session_id = fresh_session_id();
         self.created = now();
         self.last = Usage::default();
     }
@@ -171,7 +191,7 @@ impl Agent {
     fn approve(&mut self, preview: Option<String>) -> bool {
         if self.approve_all { return true; }
         if let Some(p) = preview {
-            for l in p.lines() { ui::outln(&format!("    {}", ui::faint(l))); }
+            for l in ui::clean(&p).lines() { ui::outln(&format!("    {}", ui::faint(l))); }
         }
         let sep = ui::muted(" / ");
         ui::out(&format!("  {} {}{sep}{}{sep}{} ", ui::bold("allow?"),
@@ -207,7 +227,7 @@ impl Agent {
         for step in 0..self.cfg.max_steps.max(1) {
             if self.ctx_used() > self.cfg.num_ctx * 85 / 100 && self.msgs.len() > 6 {
                 if !quiet { ui::outln(&ui::faint("  (context nearly full: compressing earlier conversation)")); }
-                self.compress()?;
+                if let Err(e) = self.compress() { self.msgs.pop_if_user(); return Err(e); }
             }
             let schemas = if self.tools_supported { tools::schemas(&self.cfg) } else { vec![] };
             let mut printed_any = false;
@@ -215,7 +235,7 @@ impl Agent {
             let mut on_text = |t: &str| {
                 // text right under the header; a blank line when it follows tool output
                 if !printed_any { if !quiet && step > 0 { ui::out("\n"); } printed_any = true; }
-                ui::out(&md.push(t));
+                ui::out(&md.push(&ui::clean(t)));
             };
             let result = match self.backend.chat(&self.cfg, &self.model, &self.msgs, &schemas, &mut on_text) {
                 Err(BackendError::ToolsUnsupported(m)) if self.tools_supported => {
@@ -258,15 +278,16 @@ impl Agent {
                     self.msgs.push(Msg::tool_result(call, "Skipped: the user declined an earlier action in this step.".into()));
                     continue;
                 }
-                let desc = tools::describe(&call.name, &call.args);
+                // the tool name and arguments come from the model: shown without control characters
+                let label = ui::clean(&format!("{}: {}", call.name, tools::describe(&call.name, &call.args)));
                 if prev_calls.contains(&(call.name.clone(), call.args.to_string())) {
-                    if !quiet { ui::outln(&format!("  {} {}", ui::paint(ui::TOOL_MARK, ui::WHITE, true), ui::faint(&ui::truncate(&format!("{}: {desc}  (skipped: same as the previous step)", call.name), 110)))); }
+                    if !quiet { ui::outln(&format!("  {} {}", ui::paint(ui::TOOL_MARK, ui::WHITE, true), ui::faint(&ui::truncate(&format!("{label}  (skipped: same as the previous step)"), 110)))); }
                     self.msgs.push(Msg::tool_result(call, REPEAT_NOTE.into()));
                     continue;
                 }
                 only_repeats = false;
                 tool_calls_made += 1;
-                if !quiet { ui::outln(&format!("  {} {}", ui::paint(ui::TOOL_MARK, ui::WHITE, true), ui::muted(&ui::truncate(&format!("{}: {desc}", call.name), 110)))); }
+                if !quiet { ui::outln(&format!("  {} {}", ui::paint(ui::TOOL_MARK, ui::WHITE, true), ui::muted(&ui::truncate(&label, 110)))); }
                 let tool = tools::find(&call.name);
                 let result = match &tool {
                     None => format!("ERROR: unknown tool '{}'", call.name),
@@ -278,7 +299,8 @@ impl Agent {
                     Some(_) => tools::execute(&call.name, &call.args, &self.cfg),
                 };
                 if !quiet {
-                    let lines: Vec<&str> = result.lines().collect();
+                    let shown = ui::clean(&result);
+                    let lines: Vec<&str> = shown.lines().collect();
                     for l in lines.iter().take(4) { ui::outln(&format!("    {}", ui::faint(&ui::truncate(l, 110)))); }
                     if lines.len() > 4 { ui::outln(&format!("    {}", ui::faint(&format!("… {} more lines", lines.len() - 4)))); }
                 }
@@ -371,6 +393,21 @@ mod tests {
         // only one user turn: nothing earlier to summarize separately, so summarize it all
         let msgs = vec![m("system"), m("user"), m("assistant"), m("tool")];
         assert_eq!(compress_split(&msgs), 4);
+    }
+
+    #[test]
+    fn new_sessions_skip_taken_ids() {
+        let taken = ["20261109-085848", "20261109-085848-2"];
+        assert_eq!(super::first_free("20261109-090000", |id| taken.contains(&id)), "20261109-090000");
+        assert_eq!(super::first_free("20261109-085848", |id| taken.contains(&id)), "20261109-085848-3");
+    }
+
+    #[test]
+    fn full_ids_match_exactly() {
+        let ids = || vec!["20261109-085848-2".to_string(), "20261109-085848".to_string(), "20261108-120000".to_string()];
+        assert_eq!(super::matching(ids(), "20261109-085848"), ["20261109-085848"]);
+        assert_eq!(super::matching(ids(), "20261109"), ["20261109-085848-2", "20261109-085848"]);
+        assert_eq!(super::matching(ids(), "").len(), 3); // "" = all, newest first
     }
 
     #[test]
