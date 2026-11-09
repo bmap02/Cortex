@@ -20,7 +20,7 @@ Windows, macOS and Linux. It is a single ~5 MB Rust binary with no telemetry, an
 - **Approval before changes**: shell commands, Python and file writes ask y/n/always first, and
   one "no" stops the agent and hands control back to you
 - **Cross-platform**: PowerShell on Windows, `sh` on macOS/Linux, colors in every modern terminal
-- **Sessions** are saved automatically and can be resumed with `cortex -r`
+- **Sessions** are saved automatically and can be resumed with `cortex -r`, or `/resume last` in a chat
 - **Context management**: `/compress`, plus automatic compression when the context is ~85% full
 - **One-shot and pipe mode**: `git diff | cortex run -q "write a commit message"`
 - **Offline by default**: the `fetch_url` web tool stays off until you enable it
