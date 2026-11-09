@@ -12,8 +12,9 @@ Windows, macOS and Linux. It is a single ~5 MB Rust binary with no telemetry, an
 **any OpenAI-compatible server** (llama.cpp, LM Studio, vLLM, LocalAI, Jan).
 
 - **Streaming chat** with history, multi-line input and Tab-completed `/commands`
-- **Markdown rendering** as replies stream in: headings, bold, italics, links, lists, quotes and
-  syntax-highlighted code blocks that copy cleanly (piped output stays plain Markdown)
+- **Markdown rendering** as replies stream in: headings, bold, italics, strikethrough, clickable links,
+  lists, quotes and syntax-highlighted code blocks that copy cleanly (piped output and `NO_COLOR=1`
+  give plain Markdown)
 - **Agent tools**: read, write, patch, list and search files; run shell commands and Python;
   exact math; long-term memory
 - **Approval before changes**: shell commands, Python and file writes ask y/n/always first, and
@@ -191,10 +192,10 @@ Binaries are built by GitHub Actions. To publish a new version:
 1. Bump `version` in `Cargo.toml`, then run `cargo update -w` so `Cargo.lock` picks up the new version
    (CI and the release build use `--locked` and fail if they disagree).
 2. Commit and push both files.
-3. Tag and push the tag:
+3. Tag the new version and push the tag (replace `vX.Y.Z` with it, e.g. `v0.1.2`):
 
 ```bash
-git tag v0.1.1 && git push origin v0.1.1
+git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
 The Release workflow builds every platform and attaches the archives and `SHA256SUMS.txt` to a new
@@ -223,6 +224,11 @@ connection and lists the models on the server. On an empty Ollama install it off
 `llama3.1`+, `mistral-nemo` or `granite3.x`. Models without tool support still work as plain chat;
 Cortex detects this and switches automatically. For llama.cpp, start the server with `--jinja` so
 tool calls work.
+
+If a model answers with raw JSON like `{"name": "run_shell", "arguments": ...}`, it is writing its tool
+calls as text instead of making them; try another model (the `qwen2.5-coder` builds do this now and
+then). With "thinking" models such as `qwen3`, `cortex config set think false` gives faster, more direct
+answers; `auto` goes back to the model's default.
 
 ## Usage
 
