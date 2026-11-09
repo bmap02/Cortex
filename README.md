@@ -6,7 +6,7 @@
 [![Latest release](https://img.shields.io/github/v/release/bmap02/Cortex)](https://github.com/bmap02/Cortex/releases/latest)
 [![Status: early development](https://img.shields.io/badge/status-early%20development-orange.svg)](#)
 [![CI](https://github.com/bmap02/Cortex/actions/workflows/ci.yml/badge.svg)](https://github.com/bmap02/Cortex/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 
 A lightweight AI agent for your terminal that runs entirely on your machine, on
@@ -340,4 +340,4 @@ Run the tests with `cargo test`. For an end-to-end check without a GPU, start
 `python3 tests/mock_server.py 11999` and point Cortex at `http://127.0.0.1:11999` (Ollama) or
 `http://127.0.0.1:11999/v1` (OpenAI).
 
-MIT licensed.
+Licensed under the [Apache License 2.0](LICENSE).
