@@ -4,6 +4,7 @@ mod agent;
 mod backend;
 mod calc;
 mod config;
+mod markdown;
 mod tools;
 mod ui;
 
@@ -122,7 +123,7 @@ fn main() {
 
 const SLASH: &[(&str, &str)] = &[
     ("/help", "show commands"),
-    ("/new", "start a fresh conversation"),
+    ("/new", "start a fresh conversation and clear the screen"),
     ("/model", "show or switch model: /model qwen2.5:7b"),
     ("/models", "list models on the server"),
     ("/tools", "list tools"),
@@ -346,7 +347,14 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
             for (c, d) in SLASH { println!("  {}  {}", ui::bold(&format!("{c:<10}")), ui::muted(d)); }
             println!("  {}", ui::faint("Ctrl+C stops a reply · end a line with \\ for multi-line · Tab completes commands"));
         }
-        "/new" | "/reset" | "/clear" => { agent.save(); agent.reset(); println!("{}", ui::muted("new conversation")); }
+        "/new" | "/reset" | "/clear" => {
+            agent.save();
+            agent.reset();
+            // clear the screen and its scrollback, then start over from the banner
+            if ui::color_on() { print!("\x1b[2J\x1b[3J\x1b[H"); }
+            if agent.cfg.show_banner { print!("{}", ui::banner(&banner_info(agent))); }
+            println!("{}", ui::muted("new conversation"));
+        }
         "/model" if arg.is_empty() => println!("  {} {}", ui::bold(&agent.model), ui::muted(&format!("via {} at {}", agent.cfg.backend.label(), agent.cfg.base_url))),
         "/model" => {
             agent.model = arg.to_string();

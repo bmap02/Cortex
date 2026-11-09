@@ -12,6 +12,8 @@ Windows, macOS and Linux. It is a single ~5 MB Rust binary with no telemetry, an
 **any OpenAI-compatible server** (llama.cpp, LM Studio, vLLM, LocalAI, Jan).
 
 - **Streaming chat** with history, multi-line input and Tab-completed `/commands`
+- **Markdown rendering** as replies stream in: headings, bold, italics, links, lists, quotes and
+  syntax-highlighted code blocks that copy cleanly (piped output stays plain Markdown)
 - **Agent tools**: read, write, patch, list and search files; run shell commands and Python;
   exact math; long-term memory
 - **Approval before changes**: shell commands, Python and file writes ask y/n/always first, and
@@ -262,7 +264,7 @@ into system RAM, so step back down. With an OpenAI-compatible server, the server
 | `/help` | list all commands |
 | `/model [name]` | show or switch the model |
 | `/models` `/tools` | list models / tools |
-| `/new` | fresh conversation |
+| `/new` | fresh conversation; clears the screen |
 | `/retry` `/undo` | regenerate / drop the last exchange |
 | `/compress` | summarize the conversation to free context |
 | `/usage` | token counts and context fill |
@@ -295,6 +297,7 @@ model = "qwen2.5:7b"
 api_key_env = ""              # name of an env var with a key, if your server needs one
 num_ctx = 8192                # context window; also /context 32k or `cortex --ctx 32k` for one run
 temperature = 0.7
+# think = false               # Ollama thinking on/off for models that support it (default: the model's own)
 max_steps = 12                # tool rounds per message
 auto_approve = false
 allow_network = false         # enables fetch_url
@@ -311,6 +314,7 @@ src/backend.rs   Ollama + OpenAI-compatible streaming clients
 src/tools.rs     tool schemas and implementations
 src/calc.rs      calculator
 src/ui.rs        banner, colors, status line
+src/markdown.rs  streaming Markdown rendering for replies
 tests/mock_server.py   fake Ollama/OpenAI server for testing without a model
 install.sh / install.ps1   one-line installers (download a release)
 install-windows.cmd/.ps1   all-in-one Windows installer (builds from source)

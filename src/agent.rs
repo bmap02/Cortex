@@ -3,6 +3,7 @@
 
 use crate::backend::{Backend, BackendError, Msg, Usage, INTERRUPT};
 use crate::config::{self, Config};
+use crate::markdown::Markdown;
 use crate::{tools, ui};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
@@ -203,18 +204,23 @@ impl Agent {
             }
             let schemas = if self.tools_supported { tools::schemas(&self.cfg) } else { vec![] };
             let mut printed_any = false;
+            let mut md = Markdown::for_terminal();
             let mut on_text = |t: &str| {
                 // text right under the header; a blank line when it follows tool output
                 if !printed_any { if !quiet && step > 0 { ui::out("\n"); } printed_any = true; }
-                ui::out(t);
+                ui::out(&md.push(t));
             };
-            let reply = match self.backend.chat(&self.cfg, &self.model, &self.msgs, &schemas, &mut on_text) {
-                Ok(r) => r,
+            let result = match self.backend.chat(&self.cfg, &self.model, &self.msgs, &schemas, &mut on_text) {
                 Err(BackendError::ToolsUnsupported(m)) if self.tools_supported => {
                     self.tools_supported = false;
                     if !quiet { ui::outln(&ui::faint(&format!("  ({}: {m}. Continuing as plain chat; pick a tool-capable model for agent features.)", self.model))); }
-                    self.backend.chat(&self.cfg, &self.model, &self.msgs, &[], &mut on_text).map_err(|e| e.to_string())?
+                    self.backend.chat(&self.cfg, &self.model, &self.msgs, &[], &mut on_text)
                 }
+                other => other,
+            };
+            ui::out(&md.finish()); // print anything held back and reset styles, even after an error
+            let reply = match result {
+                Ok(r) => r,
                 Err(e) => { self.msgs.pop_if_user(); return Err(e.to_string()); }
             };
             if !reply.content.is_empty() { ui::out("\n"); }

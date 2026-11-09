@@ -12,7 +12,7 @@ pub const BORDER: Rgb = (78, 78, 78);
 pub const BAR_BG: Rgb = (51, 51, 51);
 pub const ERR: Rgb = (255, 120, 120);
 
-fn color_on() -> bool {
+pub fn color_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os("NO_COLOR").is_none()
@@ -64,14 +64,25 @@ pub fn truncate_start(s: &str, max: usize) -> String {
 /// "1 session", "3 sessions".
 pub fn plural(n: usize, word: &str) -> String { format!("{n} {word}{}", if n == 1 { "" } else { "s" }) }
 
-/// Whether `c` is part of an ANSI escape sequence; `esc` carries the state between calls.
-fn in_escape(esc: &mut bool, c: char) -> bool {
-    if *esc {
-        if ('@'..='~').contains(&c) && c != '[' { *esc = false; }
-        return true;
-    }
-    if c == '\x1b' { *esc = true; return true; }
-    false
+/// Where we are in an escape sequence: colours are CSI (`ESC [ ... m`), clickable links are
+/// OSC 8 (`ESC ] 8;;url ESC \`).
+#[derive(Clone, Copy)]
+enum Esc { None, Start, Csi, Osc, OscEnd }
+
+/// Whether `c` is part of an escape sequence (and so takes no space on screen); `esc` carries
+/// the state between calls.
+fn in_escape(esc: &mut Esc, c: char) -> bool {
+    *esc = match (*esc, c) {
+        (Esc::None, '\x1b') => Esc::Start,
+        (Esc::None, _) => return false,
+        (Esc::Start, '[') => Esc::Csi,
+        (Esc::Start, ']') => Esc::Osc,
+        (Esc::Csi, '@'..='~') => Esc::None,
+        (Esc::Osc, '\x1b') => Esc::OscEnd,
+        (Esc::Osc, '\x07') | (Esc::Start | Esc::OscEnd, _) => Esc::None,
+        (state, _) => state,
+    };
+    true
 }
 
 pub fn bar(frac: f64, cells: usize) -> String {
@@ -208,8 +219,8 @@ pub fn banner(info: &BannerInfo) -> String {
 // Everything printed during a reply goes through out()/outln() so we know how many screen
 // rows it took. When the reply finishes we jump back up and add the stats to the model line.
 
-struct Tracker { rows: usize, col: usize, width: usize, esc: bool }
-static TRACK: std::sync::Mutex<Tracker> = std::sync::Mutex::new(Tracker { rows: 0, col: 0, width: 100, esc: false });
+struct Tracker { rows: usize, col: usize, width: usize, esc: Esc }
+static TRACK: std::sync::Mutex<Tracker> = std::sync::Mutex::new(Tracker { rows: 0, col: 0, width: 100, esc: Esc::None });
 
 /// Count how text advances the cursor (wrapping, newlines, wide chars, colour codes).
 pub fn feed(s: &str) {
@@ -239,7 +250,7 @@ pub fn outln(s: &str) { out(s); out("\n"); }
 
 /// Start counting rows below the line just printed.
 pub fn track_start() {
-    if let Ok(mut t) = TRACK.lock() { *t = Tracker { rows: 0, col: 0, width: term_cols().max(20), esc: false }; }
+    if let Ok(mut t) = TRACK.lock() { *t = Tracker { rows: 0, col: 0, width: term_cols().max(20), esc: Esc::None }; }
 }
 
 /// Rewrite the model line at the top of the reply so it includes the stats.
@@ -259,7 +270,7 @@ pub fn finish_header(model: &str, stats: &str) -> bool {
 
 /// Visible width of a string that may contain colour codes.
 pub fn width_of(s: &str) -> usize {
-    let mut esc = false;
+    let mut esc = Esc::None;
     s.chars().filter(|&c| !in_escape(&mut esc, c)).map(char_width).sum()
 }
 
