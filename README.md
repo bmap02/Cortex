@@ -276,7 +276,7 @@ into system RAM, so step back down. With an OpenAI-compatible server, the server
 | `/usage` | token counts and context fill |
 | `/context [size]` | show or change the context window, e.g. `/context 32k` (saved as default) |
 | `/memory` `/forget` | show / clear long-term memory |
-| `/sessions` `/resume <id>` | saved conversations |
+| `/sessions` `/resume <id>` | saved conversations; `/resume last` picks up the previous one |
 | `/sessions clear` `/sessions delete <id>` | remove all / one saved session |
 | `/yolo` | toggle auto-approve |
 | `/system` | show the system prompt |

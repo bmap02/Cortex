@@ -135,7 +135,7 @@ const SLASH: &[(&str, &str)] = &[
     ("/memory", "show long-term memory (~/.cortex/MEMORY.md)"),
     ("/forget", "clear long-term memory"),
     ("/sessions", "list saved sessions · /sessions clear · /sessions delete <id>"),
-    ("/resume", "load a session: /resume <id>"),
+    ("/resume", "load a session: /resume last, or /resume <id>"),
     ("/yolo", "toggle auto-approve for shell commands and file writes"),
     ("/system", "show the system prompt"),
     ("/exit", "quit (also Ctrl+D)"),
@@ -395,14 +395,25 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
                 println!("{}", ui::faint("  This conversation is still open and will be saved again if you keep chatting. /new starts fresh."));
             }
         }
-        "/resume" | "/load" => match agent::load_session(arg) {
-            Some(s) => {
-                println!("{}", ui::muted(&format!("resumed {} ({} messages)", s.id, s.messages.len())));
-                agent.save();
-                agent.resume(s);
+        "/resume" | "/load" => {
+            // "last" (or nothing) means the newest conversation other than this one
+            let found = if arg.is_empty() || arg == "last" {
+                agent::session_ids().into_iter().filter(|id| *id != agent.session_id).find_map(|id| agent::load_session(&id))
+            } else {
+                agent::load_session(arg)
+            };
+            match found {
+                Some(s) => {
+                    println!("{}", ui::muted(&format!("resumed {} ({} messages)", s.id, s.messages.len())));
+                    if !s.model.is_empty() && s.model != agent.model {
+                        println!("{}", ui::faint(&format!("  started with {}; continuing with {} (/model {} to switch back)", s.model, agent.model, s.model)));
+                    }
+                    agent.save();
+                    agent.resume(s);
+                }
+                None => println!("{}", ui::error("no matching session (see /sessions)")),
             }
-            None => println!("{}", ui::error("no matching session (see /sessions)")),
-        },
+        }
         "/context" | "/ctx" => context_cmd(agent, arg),
         "/yolo" => {
             agent.approve_all = !agent.approve_all;

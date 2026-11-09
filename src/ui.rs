@@ -11,6 +11,8 @@ pub const FAINT: Rgb = (94, 94, 94);
 pub const BORDER: Rgb = (78, 78, 78);
 pub const BAR_BG: Rgb = (51, 51, 51);
 pub const ERR: Rgb = (255, 120, 120);
+pub const OK: Rgb = (120, 220, 140);
+pub const WARN: Rgb = (240, 190, 90);
 
 pub fn color_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

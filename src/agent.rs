@@ -173,7 +173,9 @@ impl Agent {
         if let Some(p) = preview {
             for l in p.lines() { ui::outln(&format!("    {}", ui::faint(l))); }
         }
-        ui::out(&format!("  {} {} ", ui::bold("allow?"), ui::muted("[y]es / [n]o / [a]lways this session")));
+        let sep = ui::muted(" / ");
+        ui::out(&format!("  {} {}{sep}{}{sep}{} ", ui::bold("allow?"),
+            ui::paint("[y]es", ui::OK, false), ui::paint("[n]o", ui::ERR, false), ui::paint("[a]lways this session", ui::WARN, false)));
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_err() { return false; }
         ui::feed(if line.ends_with('\n') { &line } else { "\n" }); // the user's typed answer + Enter
