@@ -4,9 +4,10 @@
 </picture>
 
 [![Latest release](https://img.shields.io/github/v/release/bmap02/Cortex)](https://github.com/bmap02/Cortex/releases/latest)
+[![Status: early development](https://img.shields.io/badge/status-early%20development-orange.svg)](#)
 [![CI](https://github.com/bmap02/Cortex/actions/workflows/ci.yml/badge.svg)](https://github.com/bmap02/Cortex/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Status: early development](https://img.shields.io/badge/status-early%20development-orange.svg)](#)
+
 
 A lightweight AI agent for your terminal that runs entirely on your machine, on
 Windows, macOS and Linux. It is a single ~5 MB Rust binary with no telemetry, and it talks to **Ollama** or
