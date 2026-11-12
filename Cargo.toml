@@ -1,31 +1,44 @@
-[package]
-name = "cortex"
+[workspace]
+members = ["crates/cortex-core"]
+# plain `cargo test` / `cargo clippy` at the root cover the core too, not just the CLI
+default-members = [".", "crates/cortex-core"]
+
+[workspace.package]
 version = "0.1.2"
-description = "A lightweight, fully local AI agent for your terminal (Ollama or any OpenAI-compatible server)"
 license = "Apache-2.0"
 authors = ["Ben Maples"]
 repository = "https://github.com/bmap02/Cortex"
 homepage = "https://github.com/bmap02/Cortex"
+edition = "2024"
+
+# only the crates both packages use; the rest stay in their own package
+[workspace.dependencies]
+serde_json = "1.0.154"
+toml = "1.2.0"
+ureq = { version = "2", features = ["json"] }
+
+[package]
+name = "cortex"
+description = "A lightweight, fully local AI agent for your terminal (Ollama or any OpenAI-compatible server)"
 readme = "README.md"
 keywords = ["llm", "ollama", "agent", "cli", "local-ai"]
 categories = ["command-line-utilities"]
-edition = "2024"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
 
 [dependencies]
-enable-ansi-support = "0.2"  # turns on ANSI colors in Windows consoles; no-op elsewhere
+cortex-core = { path = "crates/cortex-core" }
 clap = { version = "4.6.7", features = ["derive"] }
 ctrlc = "3.5.2"
-regex = "1.13.1"
 rustyline = "19.0.0"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+serde_json.workspace = true
 sysinfo = "0.40.1"
-toml = "1.2.0"
-ureq = { version = "2", features = ["json"] }
-terminal_size = "0.4.4"
-unicode-width = "0.2"
-# code block highlighting; pure-Rust regex engine (no C compiler needed) and the bundled grammars/themes
-syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+toml.workspace = true
+ureq.workspace = true
 
 [profile.release]
 opt-level = 3

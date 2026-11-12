@@ -194,14 +194,24 @@ name = "cortex"
 version = "0.1.2"
 dependencies = [
  "clap",
+ "cortex-core",
  "ctrlc",
+ "rustyline",
+ "serde_json",
+ "sysinfo",
+ "toml",
+ "ureq",
+]
+
+[[package]]
+name = "cortex-core"
+version = "0.1.2"
+dependencies = [
  "enable-ansi-support",
  "regex",
- "rustyline",
  "serde",
  "serde_json",
  "syntect",
- "sysinfo",
  "terminal_size",
  "toml",
  "unicode-width",

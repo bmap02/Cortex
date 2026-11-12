@@ -1,13 +1,6 @@
 //! Cortex: a lightweight, fully local AI agent for the terminal.
 
-mod agent;
-mod backend;
-mod calc;
-mod config;
-mod markdown;
-mod tools;
-mod ui;
-
+use cortex_core::{agent, backend, config, tools, ui};
 use agent::Agent;
 use backend::{Backend, INTERRUPT};
 use clap::{Parser, Subcommand};

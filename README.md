@@ -332,13 +332,15 @@ disabled_tools = []
 ## Project layout
 
 ```
-src/main.rs      CLI, interactive loop, slash commands, setup & doctor
-src/agent.rs     agent loop, sessions, memory, compression
-src/backend.rs   Ollama + OpenAI-compatible streaming clients
-src/tools.rs     tool schemas and implementations
-src/calc.rs      calculator
-src/ui.rs        banner, colors, status line
-src/markdown.rs  streaming Markdown rendering for replies
+src/main.rs      the `cortex` CLI: interactive loop, slash commands, setup & doctor
+crates/cortex-core/              the core library the CLI is built on:
+crates/cortex-core/src/agent.rs     agent loop, sessions, memory, compression
+crates/cortex-core/src/backend.rs   Ollama + OpenAI-compatible streaming clients
+crates/cortex-core/src/tools.rs     tool schemas and implementations
+crates/cortex-core/src/config.rs    settings and the Cortex home folder
+crates/cortex-core/src/calc.rs      calculator
+crates/cortex-core/src/ui.rs        banner, colors, status line
+crates/cortex-core/src/markdown.rs  streaming Markdown rendering for replies
 tests/mock_server.py   fake Ollama/OpenAI server for testing without a model
 install.sh / install.ps1   one-line installers (download a release)
 install-windows.cmd/.ps1   all-in-one Windows installer (builds from source)
