@@ -1,6 +1,7 @@
 //! Cortex: a lightweight, fully local AI agent for the terminal.
 
 mod markdown;
+mod self_update;
 mod turn;
 mod ui;
 
@@ -705,8 +706,9 @@ fn version_parts(v: &str) -> Vec<u64> {
     v.trim().trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect()
 }
 
-/// `cortex update`: if a newer release exists, run the official installer (it downloads the
-/// release, checks it against SHA256SUMS.txt and swaps the binary, even while Cortex is running).
+/// `cortex update`: if a newer release exists, download it, check it against SHA256SUMS.txt and
+/// swap the binary (even while Cortex is running). Windows does this itself (see self_update);
+/// macOS and Linux run the official install script.
 fn update() -> i32 {
     let current = env!("CARGO_PKG_VERSION");
     let latest = ureq::get(&format!("https://api.github.com/repos/{}/releases/latest", repo()))
@@ -727,21 +729,28 @@ fn update() -> i32 {
 
     // install into the folder this cortex runs from, so the one on your PATH is the one replaced
     // (e.g. ~/.cargo/bin for `cargo install` builds, not the installer's default folder)
-    let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let script = format!("https://raw.githubusercontent.com/{}/main/install", repo());
-    let mut cmd = if cfg!(windows) {
-        let mut c = std::process::Command::new("powershell");
-        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &format!("irm {script}.ps1 | iex")]);
-        c
-    } else {
-        let mut c = std::process::Command::new("sh");
-        c.args(["-c", &format!("curl -fsSL {script}.sh | sh")]);
-        c
+    let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) else {
+        eprintln!("{}", ui::error("couldn't find the cortex program to update"));
+        return 1;
     };
-    if let Some(d) = &dir { cmd.env("CORTEX_INSTALL_DIR", d); }
-    cmd.env("CORTEX_REPO", repo());
+    install_release(&latest, &dir)
+}
+
+#[cfg(windows)]
+fn install_release(tag: &str, dir: &std::path::Path) -> i32 {
+    match self_update::install_windows(repo(), tag, dir, |s| println!("{}", ui::muted(s))) {
+        Ok(v) => { println!("{}", ui::bold(&format!("Updated to {tag} ({v})."))); 0 }
+        Err(e) => { eprintln!("{}", ui::error(&e)); 1 }
+    }
+}
+
+#[cfg(not(windows))]
+fn install_release(tag: &str, dir: &std::path::Path) -> i32 {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", &format!("curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh | sh", repo())]);
+    cmd.env("CORTEX_INSTALL_DIR", dir).env("CORTEX_REPO", repo()).env("CORTEX_VERSION", tag);
     match cmd.status() {
-        Ok(s) if s.success() => { println!("{}", ui::bold(&format!("Updated to {latest}."))); 0 }
+        Ok(s) if s.success() => { println!("{}", ui::bold(&format!("Updated to {tag}."))); 0 }
         Ok(s) => { eprintln!("{}", ui::error(&format!("update failed (installer exit code {})", s.code().unwrap_or(-1)))); 1 }
         Err(e) => { eprintln!("{}", ui::error(&format!("couldn't run the installer: {e}"))); 1 }
     }
