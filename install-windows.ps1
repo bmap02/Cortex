@@ -146,8 +146,9 @@ if (-not $Model -and -not $SkipModel) {
     & cortex config set base_url $OllamaUrl | Out-Null
     $recommended = @(& cortex models recommend --names 2>$null)
     $suggest = if ($recommended.Count -gt 0) { $recommended[0] } else { 'qwen2.5:3b' }
-    # the numbered choices: the models already here, or else the recommendations
-    $choices = if ($installed.Count -gt 0) { $installed } else { $recommended }
+    # the numbered choices: the models already here, or else the recommendations. @() keeps a
+    # single model a list: without it PowerShell unwraps it to a string, and [0] is its first letter
+    $choices = @(if ($installed.Count -gt 0) { $installed } else { $recommended })
     if ($installed.Count -gt 0) {
         Info "Models you already have:"
         for ($i = 0; $i -lt $installed.Count; $i++) { Write-Host ("        {0}) {1}" -f ($i + 1), $installed[$i]) }
