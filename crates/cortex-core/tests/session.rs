@@ -3,44 +3,9 @@
 
 use cortex_core::agent::{Agent, Approval, Event, StopReason};
 use cortex_core::config::Config;
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
-use std::sync::Once;
 
-/// A fake model server on a free port, stopped when dropped.
-struct MockServer { child: Child, port: u16 }
-
-impl MockServer {
-    fn start() -> MockServer {
-        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/mock_server.py");
-        // python3 first; on Windows it can be a Store placeholder that prints nothing, so fall through
-        for py in ["python3", "python"] {
-            let Ok(mut child) = Command::new(py).args(["-u", script, "0"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { continue };
-            let mut line = String::new();
-            let _ = BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut line);
-            match line.trim().strip_prefix("PORT ").and_then(|p| p.parse().ok()) {
-                Some(port) => return MockServer { child, port },
-                None => { let _ = child.kill(); let _ = child.wait(); }
-            }
-        }
-        panic!("python is needed to run the fake model server (tests/mock_server.py)")
-    }
-}
-
-impl Drop for MockServer {
-    fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); }
-}
-
-/// Sessions save under the Cortex home folder: keep them in a temporary one.
-fn temp_home() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let home = std::env::temp_dir().join(format!("cortex_session_tests{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        // SAFETY: set once, before any test reads the environment (every test calls this first)
-        unsafe { std::env::set_var("CORTEX_HOME", home) };
-    });
-}
+mod common;
+use common::{temp_home, MockServer};
 
 fn agent(server: &MockServer) -> Agent {
     temp_home();

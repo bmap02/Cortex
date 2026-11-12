@@ -140,22 +140,28 @@ $installed = @()
 try { $installed = @((Invoke-RestMethod -Uri "$OllamaUrl/api/tags").models | ForEach-Object { $_.name }) } catch { }
 
 if (-not $Model -and -not $SkipModel) {
-    $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
-    $suggest = if ($ramGB -ge 14) { 'qwen2.5:7b' } else { 'qwen2.5:3b' }
+    # Cortex's own recommendations (`cortex models recommend`), so the two never disagree. Point
+    # Cortex at Ollama first so they come as Ollama model names.
+    & cortex config set backend ollama | Out-Null
+    & cortex config set base_url $OllamaUrl | Out-Null
+    $recommended = @(& cortex models recommend --names 2>$null)
+    $suggest = if ($recommended.Count -gt 0) { $recommended[0] } else { 'qwen2.5:3b' }
+    # the numbered choices: the models already here, or else the recommendations
+    $choices = if ($installed.Count -gt 0) { $installed } else { $recommended }
     if ($installed.Count -gt 0) {
         Info "Models you already have:"
         for ($i = 0; $i -lt $installed.Count; $i++) { Write-Host ("        {0}) {1}" -f ($i + 1), $installed[$i]) }
         Info "Pick a number, type another model name to download it, or press Enter for $suggest."
+        Info "(Run 'cortex models recommend' later to see which models suit this PC.)"
     } else {
-        Info "This PC has $ramGB GB of RAM. Models that work well with Cortex's tools:"
-        Write-Host "        qwen2.5:7b   about 4.7 GB  best all-rounder (16 GB RAM or a GPU with 8 GB+)"
-        Write-Host "        qwen2.5:3b   about 1.9 GB  for laptops and 8 GB machines"
-        Write-Host "        qwen3:8b     about 5.2 GB  newer, stronger reasoning"
-        Info "Type a model name, or press Enter for $suggest."
+        Info "Models that suit this PC, best first:"
+        # just the numbered model lines of the table
+        & cortex models recommend | Where-Object { $_ -match '^\s+\d+\.\s' } | Select-Object -First 8 | ForEach-Object { Write-Host "    $_" }
+        Info "Pick a number, type a model name, or press Enter for $suggest."
     }
     $answer = (Read-Host "      model").Trim()
     if (-not $answer) { $Model = $suggest }
-    elseif ($answer -match '^\d+$' -and [int]$answer -ge 1 -and [int]$answer -le $installed.Count) { $Model = $installed[[int]$answer - 1] }
+    elseif ($answer -match '^\d+$' -and [int]$answer -ge 1 -and [int]$answer -le $choices.Count) { $Model = $choices[[int]$answer - 1] }
     else { $Model = $answer }
 }
 

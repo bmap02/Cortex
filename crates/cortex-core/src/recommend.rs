@@ -1,11 +1,14 @@
-//! Which models suit a machine: a pure function of its hardware profile and the model catalog.
+//! Which models suit a machine: `recommend` is a pure function of a hardware profile and a
+//! catalog. The catalog is bundled into the binary, and `cortex update` can save a newer one in
+//! the Cortex home folder (`catalog`, `save_downloaded_catalog`).
 
-use crate::config::BackendKind;
+use crate::config::{self, BackendKind};
 use crate::hardware::{GpuVendor, HardwareProfile};
 use serde::Deserialize;
 
 /// A model in the catalog. Sizes are in GB.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)] // a field this version doesn't know means a format it can't read
 pub struct CatalogEntry {
     /// The Ollama model name, e.g. "qwen2.5:7b".
     pub id: String,
@@ -58,11 +61,75 @@ pub struct Recommendations {
     pub can_install: bool,
 }
 
-/// The catalog bundled into this build.
-pub fn catalog() -> Vec<CatalogEntry> {
+/// A model catalog and the date it was last changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Catalog {
+    /// YYYY-MM-DD, so later dates compare as greater.
+    pub updated: String,
+    pub models: Vec<CatalogEntry>,
+}
+
+/// The catalog layout this version reads. Bump it (and the `format` in catalog.toml) when a change
+/// would make older versions misread the file, such as a new field; they then keep their own.
+pub const CATALOG_FORMAT: u32 = 1;
+
+/// Read a catalog file, refusing one Cortex couldn't recommend from.
+pub fn parse_catalog(text: &str) -> Result<Catalog, String> {
     #[derive(Deserialize)]
-    struct File { model: Vec<CatalogEntry> }
-    toml::from_str::<File>(include_str!("../catalog.toml")).expect("the bundled catalog is valid (checked by its test)").model
+    struct Format { format: Option<u32> }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct File { #[allow(dead_code)] format: u32, updated: String, model: Vec<CatalogEntry> }
+    let format = toml::from_str::<Format>(text).ok().and_then(|f| f.format);
+    if format.is_some_and(|f| f > CATALOG_FORMAT) {
+        return Err("the catalog is for a newer Cortex".into());
+    }
+    let f: File = toml::from_str(text).map_err(|e| format!("not a model catalog: {e}"))?;
+    let is_date = f.updated.len() == 10 && f.updated.chars().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() });
+    if !is_date { return Err(format!("the catalog's date '{}' isn't YYYY-MM-DD", f.updated)); }
+    if f.model.is_empty() { return Err("the catalog lists no models".into()); }
+    for m in &f.model {
+        if !m.tools { return Err(format!("{} can't call tools, so it doesn't belong in the catalog", m.id)); }
+        if !(m.params_b > 0.0 && m.download_gb > 0.0 && m.memory_gb > m.download_gb) {
+            return Err(format!("{}: its sizes don't add up (it needs more memory than its download)", m.id));
+        }
+    }
+    Ok(Catalog { updated: f.updated, models: f.model })
+}
+
+/// The catalog bundled into this build.
+pub fn bundled_catalog() -> Catalog {
+    parse_catalog(include_str!("../catalog.toml")).expect("the bundled catalog is valid (checked by its test)")
+}
+
+/// The bundled catalog, or a downloaded one if it's valid and newer.
+pub fn newest_catalog(bundled: Catalog, downloaded: Option<&str>) -> Catalog {
+    match downloaded.and_then(|t| parse_catalog(t).ok()) {
+        Some(d) if d.updated > bundled.updated => d,
+        _ => bundled,
+    }
+}
+
+/// The catalog in use: the newest of the bundled one and the one `cortex update` last saved.
+fn current_catalog() -> Catalog {
+    newest_catalog(bundled_catalog(), std::fs::read_to_string(config::catalog_path()).ok().as_deref())
+}
+
+/// The models to recommend from.
+pub fn catalog() -> Vec<CatalogEntry> { current_catalog().models }
+
+/// Keep a downloaded catalog for later if it's valid and newer than the one in use. Returns its
+/// date when it was kept, None when the one in use is as new (or the download is for a newer
+/// Cortex, which this one can't read).
+pub fn save_downloaded_catalog(text: &str) -> Result<Option<String>, String> {
+    let new = match parse_catalog(text) {
+        Err(e) if e.contains("newer Cortex") => return Ok(None),
+        other => other?,
+    };
+    if new.updated <= current_catalog().updated { return Ok(None); }
+    let _ = std::fs::create_dir_all(config::home());
+    std::fs::write(config::catalog_path(), text).map_err(|e| format!("couldn't save the catalog: {e}"))?;
+    Ok(Some(new.updated))
 }
 
 /// GB/s a CPU reads from RAM, roughly (dual-channel DDR4/DDR5).

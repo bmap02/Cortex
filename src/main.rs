@@ -1,6 +1,7 @@
 //! Cortex: a lightweight, fully local AI agent for the terminal.
 
 mod markdown;
+mod models;
 mod self_update;
 mod turn;
 mod ui;
@@ -100,10 +101,24 @@ enum Cmd {
 enum ModelsCmd {
     /// List models on the server
     List,
-    /// Download a model (Ollama only)
+    /// Download any model by its Ollama name (Ollama only)
     Pull { name: String },
     /// Models that suit this machine, best first (works offline)
-    Recommend,
+    Recommend {
+        /// Print only the best one's name (for scripts)
+        #[arg(long)]
+        best: bool,
+        /// Print just the names, best first, one per line (for scripts)
+        #[arg(long, conflicts_with = "best")]
+        names: bool,
+    },
+    /// Download a recommended model: its number from `cortex models recommend`, or its name
+    Install {
+        target: Option<String>,
+        /// Make it the default model too
+        #[arg(long = "use")]
+        use_it: bool,
+    },
 }
 
 fn main() {
@@ -120,10 +135,15 @@ fn main() {
         Cmd::Model { name } => pick_model(&cfg, name),
         Cmd::Models { action } => match action.unwrap_or(ModelsCmd::List) {
             ModelsCmd::List => print_models(&cfg),
-            ModelsCmd::Recommend => { print_recommendations(&cfg); 0 }
-            ModelsCmd::Pull { name } => match Backend::new(&cfg).pull(&name) {
-                Ok(()) => { println!("pulled {name}"); 0 }
-                Err(e) => { eprintln!("{}", ui::error(&e.to_string())); 1 }
+            ModelsCmd::Recommend { best, names } => models::print_recommendations(&cfg, match (best, names) {
+                (true, _) => models::Show::Best,
+                (_, true) => models::Show::Names,
+                _ => models::Show::Table,
+            }),
+            ModelsCmd::Install { target, use_it } => models::install(&cfg, target, use_it),
+            ModelsCmd::Pull { name } => match models::download(&cfg, &name) {
+                Ok(()) => 0,
+                Err(e) => { eprintln!("{}", ui::error(&e)); 1 }
             },
         },
         Cmd::Tools { action, name } => tools_cmd(&cfg, action, name),
@@ -502,16 +522,28 @@ fn setup() {
         Ok(models) if !models.is_empty() => {
             println!("{}", ui::muted(&format!("found {} model(s)", models.len())));
             for (i, m) in models.iter().enumerate() { println!("  {:>2}) {}  {}", i + 1, m.name, ui::faint(&m.detail)); }
+            let ollama = cfg.backend == BackendKind::Ollama;
+            let top = models::top_names(&cfg, 3);
+            if ollama && !top.is_empty() {
+                println!("  {}", ui::faint(&format!("or type 'new' to download one that suits this machine ({}, ...)", top.join(", "))));
+            } else if !top.is_empty() {
+                println!("  {}", ui::faint(&format!("models that suit this machine, to load in your server: {}", top.join(", "))));
+            }
             let def = models.iter().position(|m| m.name == cfg.model).map(|i| (i + 1).to_string()).unwrap_or("1".into());
             let pick = ask("model number or name", &def);
-            cfg.model = pick.parse::<usize>().ok().and_then(|i| models.get(i.wrapping_sub(1))).map(|m| m.name.clone()).unwrap_or(pick);
+            if ollama && pick.eq_ignore_ascii_case("new") {
+                if let Some(id) = models::choose_for_setup(&cfg) { cfg.model = id; }
+            } else {
+                cfg.model = pick.parse::<usize>().ok().and_then(|i| models.get(i.wrapping_sub(1))).map(|m| m.name.clone()).unwrap_or(pick);
+            }
         }
         Ok(_) => {
             println!("{}", ui::muted("connected, but the server has no models."));
             if cfg.backend == BackendKind::Ollama {
-                let m = ask("model to download now (blank to skip)", "qwen2.5:7b");
-                if !m.is_empty() && Backend::new(&cfg).pull(&m).is_ok() { cfg.model = m; }
+                if let Some(id) = models::choose_for_setup(&cfg) { cfg.model = id; }
             } else {
+                let top = models::top_names(&cfg, 3);
+                if !top.is_empty() { println!("  {}", ui::faint(&format!("models that suit this machine, to load in your server: {}", top.join(", ")))); }
                 cfg.model = ask("model name", &cfg.model);
             }
         }
@@ -553,61 +585,6 @@ fn print_models(cfg: &Config) -> i32 {
         }
         Err(e) => { eprintln!("{}", ui::error(&e.to_string())); 1 }
     }
-}
-
-fn print_recommendations(cfg: &Config) {
-    use cortex_core::recommend::{self, Fit, Speed};
-    let hw = cortex_core::hardware::probe();
-    if hw.total_ram_gb <= 0.0 {
-        println!("{}", ui::error("Couldn't read how much memory this machine has, so there's nothing to recommend from."));
-        return;
-    }
-    let recs = recommend::recommend(&hw, &recommend::catalog(), cfg.backend);
-    let (summary, details) = describe_hardware(&hw);
-    println!("{}", ui::bold(&format!("This machine: {summary}")));
-    for d in details { println!("{}", ui::faint(&format!("  {d}"))); }
-    println!();
-    let (fits, too_big): (Vec<_>, Vec<_>) = recs.models.iter().partition(|r| r.fit != Fit::DoesntFit);
-    if fits.is_empty() { println!("{}", ui::error("None of the models Cortex knows fit in this machine's memory.")); }
-    for (i, r) in fits.iter().enumerate() {
-        let m = &r.model;
-        // other servers name models differently: show what to look for there
-        let shown = r.display_name(recs.can_install);
-        let fit = match r.fit { Fit::OnGpu => "fits on GPU", Fit::PartlyOnCpu => "partly on CPU", Fit::CpuOnly | Fit::DoesntFit => "CPU only" };
-        let speed = match r.speed { Some(Speed::Fast) => "fast", Some(Speed::Moderate) => "moderate", Some(Speed::Slow) | None => "slow" };
-        let params = if m.params_b < 10.0 { format!("{:.1}B", m.params_b) } else { format!("{:.0}B", m.params_b) };
-        // pad before styling: escape codes would count toward the width
-        let mark = if m.id == cfg.model || m.name == cfg.model { ui::bold(&format!("{:>3}", ui::DOT)) } else { ui::faint(&format!("{:>2}.", i + 1)) };
-        println!("  {mark} {shown:<30} {}  {}  {fit:<14} {}", ui::faint(&format!("{params:>5}")), ui::faint(&format!("{:>4.1} GB", m.download_gb)), ui::muted(speed));
-    }
-    if !too_big.is_empty() {
-        let names: Vec<&str> = too_big.iter().map(|r| r.display_name(recs.can_install)).collect();
-        println!("  {}", ui::faint(&format!("too big for this machine: {}", names.join(", "))));
-    }
-    println!();
-    if recs.can_install {
-        println!("{}", ui::faint("  Download one with `cortex models pull <name>`, then `cortex model <name>`."));
-    } else {
-        println!("{}", ui::faint("  Recommendations only: Cortex installs models through Ollama, and you're using an OpenAI-compatible server."));
-        println!("{}", ui::faint("  Load one of these in your server, then pick it with `cortex model <name>`."));
-    }
-}
-
-/// A one-line summary of the hardware, and a line per GPU (or why there are none).
-fn describe_hardware(hw: &cortex_core::hardware::HardwareProfile) -> (String, Vec<String>) {
-    let memory = if hw.unified_memory { "unified memory, shared with the GPU" } else { "RAM" };
-    let summary = format!("{:.0} GB {memory} ({:.1} GB free) · {} {}", hw.total_ram_gb, hw.available_ram_gb, hw.os, hw.arch);
-    let details = match &hw.gpus {
-        _ if hw.unified_memory => vec![],
-        None => vec!["Couldn't detect GPUs: models are rated for the CPU only.".to_string()],
-        Some(gpus) if gpus.is_empty() => vec!["No GPU found: models are rated for the CPU.".to_string()],
-        Some(gpus) => gpus.iter().map(|g| match (g.integrated, g.vram_gb > 0.0) {
-            (true, _) => format!("GPU: {} (built in, shares RAM: not used for models)", g.name),
-            (false, true) => format!("GPU: {}, {:.1} GB", g.name, g.vram_gb),
-            (false, false) => format!("GPU: {} (couldn't read its memory: not used for models)", g.name),
-        }).collect(),
-    };
-    (summary, details)
 }
 
 fn pick_model(cfg: &Config, name: Option<String>) -> i32 {
@@ -711,6 +688,7 @@ fn version_parts(v: &str) -> Vec<u64> {
 /// macOS and Linux run the official install script.
 fn update() -> i32 {
     let current = env!("CARGO_PKG_VERSION");
+    refresh_catalog(); // even if the release check below fails
     let latest = ureq::get(&format!("https://api.github.com/repos/{}/releases/latest", repo()))
         .set("User-Agent", &format!("cortex/{current}")) // GitHub's API requires one
         .timeout(std::time::Duration::from_secs(15))
@@ -734,6 +712,19 @@ fn update() -> i32 {
         return 1;
     };
     install_release(&latest, &dir)
+}
+
+/// Fetch the latest model catalog from the repo, so recommendations stay current between releases.
+fn refresh_catalog() {
+    let url = format!("https://raw.githubusercontent.com/{}/main/crates/cortex-core/catalog.toml", repo());
+    let text = ureq::get(&url).set("User-Agent", concat!("cortex/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(15)).call().ok().and_then(|r| r.into_string().ok());
+    match text.map(|t| cortex_core::recommend::save_downloaded_catalog(&t)) {
+        Some(Ok(Some(date))) => println!("{}", ui::muted(&format!("model catalog updated ({date})"))),
+        Some(Ok(None)) => {}
+        Some(Err(e)) => eprintln!("{}", ui::faint(&format!("kept the current model catalog; the downloaded one was rejected ({e})"))),
+        None => eprintln!("{}", ui::faint("couldn't fetch the latest model catalog; keeping the current one")),
+    }
 }
 
 #[cfg(windows)]
@@ -866,7 +857,7 @@ fn doctor(cfg: &Config) -> i32 {
     let bad = |s: &str| println!("  {} {s}", ui::error("✗"));
     println!("{}", ui::bold("cortex doctor"));
     if Config::exists() { ok(&format!("config at {}", config::config_path().display())) } else { bad("no config yet: run `cortex setup`") }
-    let (summary, details) = describe_hardware(&cortex_core::hardware::probe());
+    let (summary, details) = models::describe_hardware(&cortex_core::hardware::probe());
     ok(&format!("hardware: {summary}"));
     for d in details { println!("    {}", ui::faint(&d)); }
     ok(&format!("backend: {} at {}", cfg.backend.label(), cfg.base_url));

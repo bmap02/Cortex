@@ -77,12 +77,9 @@ fn only_ollama_can_install_the_recommendations() {
 
 #[test]
 fn the_bundled_catalog_is_usable() {
-    let catalog = cortex_core::recommend::catalog();
+    // parse_catalog checks every entry calls tools and has sizes that add up
+    let catalog = cortex_core::recommend::bundled_catalog().models;
     assert!(catalog.len() >= 8);
-    for m in &catalog {
-        assert!(m.tools, "{} is in the catalog, so it should call tools", m.id);
-        assert!(m.memory_gb > m.download_gb && m.download_gb > 0.0 && m.params_b > 0.0, "{}: sizes look wrong", m.id);
-    }
     // every machine with 8 GB of RAM gets at least one model that fits
     assert!(recommend(&ram_only(8.0), &catalog, BackendKind::Ollama).models.iter().any(|r| r.fit != Fit::DoesntFit));
 }

@@ -1,5 +1,10 @@
 # Models Cortex recommends, bundled into the binary. Only tool-capable models belong here.
+# `cortex update` also downloads the latest version of this file from the repo and uses it when its
+# `updated` date is later than the bundled one's, so bump the date with every change.
 #
+# format       the layout of this file: bump it for changes older Cortex versions can't read
+#              (such as a new field), and CATALOG_FORMAT in recommend.rs with it
+# updated      the date of the last change (YYYY-MM-DD)
 # id           Ollama model name (what `cortex models pull` downloads)
 # name         what to look for in other servers (LM Studio, llama.cpp, ...)
 # params_b     parameters, in billions
@@ -7,6 +12,9 @@
 # download_gb  size of the Ollama download
 # memory_gb    estimated memory to run it at Cortex's default 8k context: weights plus the
 #              context cache plus about 0.5 GB overhead (more for models with a large cache)
+
+format = 1
+updated = "2026-11-12"
 
 [[model]]
 id = "llama3.2:1b"

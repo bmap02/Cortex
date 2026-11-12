@@ -91,6 +91,14 @@ jobs:
           out=$($BIN run -q "loop: what is 1234 * 5678?" < /dev/null)
           echo "$out"
           echo "$out" | grep -q "Not run again"
+          # one-step install through Ollama's pull (the mock serves it); a download the user starts
+          # works with the agent's network access off
+          $BIN config set allow_network false
+          $BIN models install qwen2.5:3b --use < /dev/null
+          $BIN config | grep -q 'model = "qwen2.5:3b"'
+          $BIN models | grep -q qwen2.5:3b
+          out=$($BIN run -q "what is 1234 * 5678?" < /dev/null)
+          echo "$out" | grep -q 7006652
           $BIN config set backend openai
           $BIN config set base_url http://127.0.0.1:11999/v1
           $BIN config set model mock-7b

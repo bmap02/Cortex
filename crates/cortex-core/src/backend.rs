@@ -52,6 +52,15 @@ pub struct Reply {
     pub interrupted: bool,
 }
 
+/// One update from a model download: what Ollama is doing, and bytes done of the current part
+/// (both 0 for steps without a size, such as "verifying sha256 digest").
+#[derive(Debug, Clone, PartialEq)]
+pub struct PullProgress {
+    pub status: String,
+    pub completed: u64,
+    pub total: u64,
+}
+
 pub struct ModelInfo {
     pub name: String,
     pub detail: String, // size / quantization when the server reports it
@@ -162,26 +171,24 @@ impl Backend {
         }
     }
 
-    /// Ollama only: download a model, printing progress.
-    pub fn pull(&self, model: &str) -> Result<(), BackendError> {
+    /// Ollama only: download a model. `on_progress` gets each update; `cancel` stops it. Pulls
+    /// are started by the user, so they aren't subject to the agent's network switch.
+    pub fn pull(&self, model: &str, cancel: &CancelHandle, on_progress: &mut dyn FnMut(&PullProgress)) -> Result<(), BackendError> {
         if self.kind != BackendKind::Ollama {
-            return Err(BackendError::Other("pulling models is only supported with the Ollama backend".into()));
+            return Err(BackendError::Other("Cortex installs models through Ollama; load this one in your server instead".into()));
         }
         let resp = self.req("POST", "/api/pull").send_json(json!({"model": model, "stream": true})).map_err(Self::err)?;
-        let mut last = String::new();
+        let mut finished = false;
         for line in BufReader::new(resp.into_reader()).lines() {
+            if cancel.is_cancelled() { return Err(BackendError::Other("download stopped".into())); }
             let line = line.map_err(|e| BackendError::Other(e.to_string()))?;
             let v: Value = serde_json::from_str(&line).unwrap_or_default();
             if let Some(e) = v["error"].as_str() { return Err(BackendError::Other(e.into())); }
             let status = v["status"].as_str().unwrap_or("").to_string();
-            match (v["completed"].as_f64(), v["total"].as_f64()) {
-                (Some(c), Some(t)) if t > 0.0 => eprint!("\r  {status}  {:>5.1}%  ({:.2}/{:.2} GB)   ", c / t * 100.0, c / 1e9, t / 1e9),
-                _ if status != last => { eprintln!("\r  {status}{}", " ".repeat(30)); last = status; }
-                _ => {}
-            }
+            finished = status == "success";
+            on_progress(&PullProgress { status, completed: v["completed"].as_u64().unwrap_or(0), total: v["total"].as_u64().unwrap_or(0) });
         }
-        eprintln!();
-        Ok(())
+        if finished { Ok(()) } else { Err(BackendError::Other("the download ended before it finished".into())) }
     }
 
     /// Stream a chat completion. `on_text` receives text as it arrives; `cancel` ends the

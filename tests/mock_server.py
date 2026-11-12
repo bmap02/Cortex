@@ -5,6 +5,7 @@ Scripted behaviour: if the last message is from the user, ask for a tool call
 tool result comes back, stream a final answer that quotes the result. A prompt
 containing "loop" repeats the same calculator call until Cortex refuses to rerun it.
 "write to <path>" asks to write that file; "slow" streams a long answer slowly (for stopping).
+/api/pull streams download progress and adds the model to /api/tags.
 Port 0 picks a free port and prints "PORT <n>" first, for tests that run several servers at once.
 """
 import json, sys, time
@@ -33,6 +34,8 @@ def decide(messages):
         return ("tool", "calculator", {"expression": "1234 * 5678"})
     return ("text", "Hi! I'm a mock model running locally.")
 
+PULLED = []  # models "downloaded" through /api/pull
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
@@ -43,7 +46,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/tags":
-            self._json({"models": [{"name": "mock:7b", "size": 4.1e9, "details": {"parameter_size": "7B", "quantization_level": "Q4_K_M"}}]})
+            self._json({"models": [{"name": "mock:7b", "size": 4.1e9, "details": {"parameter_size": "7B", "quantization_level": "Q4_K_M"}}]
+                       + [{"name": n, "size": 1.9e9, "details": {}} for n in PULLED]})
         elif self.path == "/v1/models":
             self._json({"data": [{"id": "mock-7b"}]})
         else:
@@ -51,6 +55,16 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/api/pull":
+            self.send_response(200); self.send_header("Content-Type", "application/x-ndjson"); self.end_headers()
+            def send(o): self.wfile.write((json.dumps(o) + "\n").encode()); self.wfile.flush()
+            send({"status": "pulling manifest"})
+            for done in range(0, 1_000_001, 250_000):
+                send({"status": "pulling 6a0746a1ec1a", "digest": "sha256:6a0746a1ec1a", "total": 1_000_000, "completed": done})
+                time.sleep(0.05)
+            for s in ["verifying sha256 digest", "writing manifest", "success"]: send({"status": s})
+            if body["model"] not in PULLED: PULLED.append(body["model"])
+            return
         if self.path == "/api/show":
             return self._json({"model_info": {"general.architecture": "qwen2", "qwen2.context_length": 32768}})
         if body.get("model") == "notools" and body.get("tools"):

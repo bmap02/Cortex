@@ -175,6 +175,7 @@ cortex           # start chatting
 ### Updating and uninstalling
 
 Run `cortex update` (v0.1.2 and later) to get the latest release, or run the install command again.
+`cortex update` also refreshes the list of models Cortex recommends, even when Cortex itself is up to date.
 Both work even while Cortex is open. `cortex update` checks GitHub for a newer release, then runs the
 installer for the folder the current `cortex` is in, so a `cargo install` build is replaced by the
 release build in place. To keep building from source instead, get the new source first: run `cargo install --git https://github.com/bmap02/Cortex` again,
@@ -257,8 +258,9 @@ cortex run "what's in this repo?"
 cat error.log | cortex run -q "what went wrong?"
 cortex run --no-tools "explain ownership in Rust"   # plain answer, no tool use
 cortex models                   # list models on the server
-cortex models pull qwen2.5:7b   # download (Ollama)
 cortex models recommend         # models that suit this machine, best first (offline)
+cortex models install 1 --use   # download a recommended one (Ollama) and switch to it
+cortex models pull qwen2.5:7b   # download any Ollama model by name
 cortex model qwen2.5:7b         # set the default model
 cortex tools                    # list tools; cortex tools disable run_shell
 cortex tools enable fetch_url   # let the agent read web pages (turns on network access)

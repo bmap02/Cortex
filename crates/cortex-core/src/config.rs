@@ -112,6 +112,8 @@ pub fn user_folder(name: &str) -> Option<PathBuf> {
 
 pub fn config_path() -> PathBuf { home().join("config.toml") }
 pub fn sessions_dir() -> PathBuf { home().join("sessions") }
+/// The model catalog `cortex update` downloaded (used when it's newer than the bundled one).
+pub fn catalog_path() -> PathBuf { home().join("catalog.toml") }
 pub fn memory_path() -> PathBuf { home().join("MEMORY.md") }
 pub fn soul_path() -> PathBuf { home().join("SOUL.md") }
 pub fn history_path() -> PathBuf { home().join("history.txt") }
