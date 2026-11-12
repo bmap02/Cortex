@@ -13,6 +13,7 @@ edition.workspace = true
 regex.workspace = true
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true  # digests for model files uploaded to Ollama
 sysinfo.workspace = true
 toml.workspace = true
 ureq.workspace = true

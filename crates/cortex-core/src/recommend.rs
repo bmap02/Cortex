@@ -205,3 +205,17 @@ pub fn recommend(hw: &HardwareProfile, catalog: &[CatalogEntry], backend: Backen
 fn speed_tier(tokens_per_s: f64) -> Speed {
     if tokens_per_s >= 25.0 { Speed::Fast } else if tokens_per_s >= 7.0 { Speed::Moderate } else { Speed::Slow }
 }
+
+/// Memory a model file needs to run at the default context: the weights, plus the context cache
+/// and runtime, which grow with the model (this matches the catalog's own figures closely).
+pub fn estimate_memory_gb(download_gb: f64) -> f64 { download_gb * 1.1 + 0.5 }
+
+/// The fit check for a model that isn't in the catalog, from the size of its file: the same
+/// verdict and speed tier a catalog model of that size would get.
+pub fn check_fit(hw: &HardwareProfile, download_gb: f64, backend: BackendKind) -> Recommendation {
+    let model = CatalogEntry {
+        id: String::new(), name: String::new(), params_b: 0.0, quant: String::new(),
+        download_gb, memory_gb: estimate_memory_gb(download_gb), tools: true,
+    };
+    recommend(hw, &[model], backend).models.remove(0)
+}

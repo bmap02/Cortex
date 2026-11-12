@@ -6,9 +6,11 @@ tool result comes back, stream a final answer that quotes the result. A prompt
 containing "loop" repeats the same calculator call until Cortex refuses to rerun it.
 "write to <path>" asks to write that file; "slow" streams a long answer slowly (for stopping).
 /api/pull streams download progress and adds the model to /api/tags.
+For imports: /api/models/<repo>/tree/main lists a Hugging Face repo's files, /files/model.gguf is a
+GGUF to download (slowly, so it can be stopped), and /api/blobs + /api/create take an upload.
 Port 0 picks a free port and prints "PORT <n>" first, for tests that run several servers at once.
 """
-import json, sys, time
+import hashlib, json, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def decide(messages):
@@ -34,7 +36,19 @@ def decide(messages):
         return ("tool", "calculator", {"expression": "1234 * 5678"})
     return ("text", "Hi! I'm a mock model running locally.")
 
-PULLED = []  # models "downloaded" through /api/pull
+PULLED = []  # models "downloaded" through /api/pull or created through /api/create
+BLOBS = set()  # sha256 digests uploaded to /api/blobs
+GGUF = b"GGUF" + bytes(range(256)) * 4096  # a ~1 MB stand-in for a model file
+GGUF_CHUNK = 64 * 1024
+# a Hugging Face repo with one file per quantization (sizes like a real 7B model)
+HF_TREE = [
+    {"type": "file", "path": "README.md", "size": 5000},
+    {"type": "file", "path": "Qwen2.5-7B-Instruct-Q4_K_M.gguf", "size": 4_683_074_240},
+    {"type": "file", "path": "Qwen2.5-7B-Instruct-Q8_0.gguf", "size": 8_098_525_888},
+    {"type": "directory", "path": "Qwen2.5-7B-Instruct-f16"},
+    {"type": "file", "path": "Qwen2.5-7B-Instruct-f16/Qwen2.5-7B-Instruct-f16-00001-of-00002.gguf", "size": 8_000_000_000},
+    {"type": "file", "path": "Qwen2.5-7B-Instruct-f16/Qwen2.5-7B-Instruct-f16-00002-of-00002.gguf", "size": 7_200_000_000},
+]
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -50,11 +64,47 @@ class H(BaseHTTPRequestHandler):
                        + [{"name": n, "size": 1.9e9, "details": {}} for n in PULLED]})
         elif self.path == "/v1/models":
             self._json({"data": [{"id": "mock-7b"}]})
+        elif self.path.startswith("/api/models/") and "/tree/main" in self.path:
+            self._json(HF_TREE if "Qwen2.5-7B-Instruct-GGUF" in self.path else {"error": "Repository not found"}, 200 if "Qwen2.5-7B-Instruct-GGUF" in self.path else 404)
+        elif self.path == "/files/model.gguf":
+            self.send_response(200); self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(GGUF))); self.end_headers()
+            try:
+                for i in range(0, len(GGUF), GGUF_CHUNK):
+                    self.wfile.write(GGUF[i:i + GGUF_CHUNK]); self.wfile.flush(); time.sleep(0.02)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass  # the client stopped the download
         else:
             self._json({"error": "not found"}, 404)
 
+    def do_HEAD(self):
+        if self.path == "/files/model.gguf":
+            self.send_response(200); self.send_header("Content-Length", str(len(GGUF))); self.end_headers()
+        elif self.path.startswith("/api/blobs/"):
+            self.send_response(200 if self.path.split(":")[-1] in BLOBS else 404); self.end_headers()
+        else:
+            self.send_response(404); self.end_headers()
+
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        if self.path.startswith("/api/blobs/sha256:"):
+            # like Ollama: the upload must match the digest it's stored under
+            digest = self.path.split(":")[-1]
+            if hashlib.sha256(raw).hexdigest() != digest:
+                return self._json({"error": "digest mismatch"}, 400)
+            BLOBS.add(digest)
+            self.send_response(201); self.send_header("Content-Length", "0"); self.end_headers()
+            return
+        body = json.loads(raw)
+        if self.path == "/api/create":
+            missing = [d for d in body.get("files", {}).values() if d.split(":")[-1] not in BLOBS]
+            if missing or not body.get("files"):
+                return self._json({"error": f"blob not found: {missing}"}, 400)
+            self.send_response(200); self.send_header("Content-Type", "application/x-ndjson"); self.end_headers()
+            for st in ["parsing GGUF", "using existing layer " + next(iter(body["files"].values())), "writing manifest", "success"]:
+                self.wfile.write((json.dumps({"status": st}) + "\n").encode()); self.wfile.flush()
+            if body["model"] not in PULLED: PULLED.append(body["model"])
+            return
         if self.path == "/api/pull":
             self.send_response(200); self.send_header("Content-Type", "application/x-ndjson"); self.end_headers()
             def send(o): self.wfile.write((json.dumps(o) + "\n").encode()); self.wfile.flush()

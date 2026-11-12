@@ -99,6 +99,10 @@ jobs:
           $BIN models | grep -q qwen2.5:3b
           out=$($BIN run -q "what is 1234 * 5678?" < /dev/null)
           echo "$out" | grep -q 7006652
+          # importing a GGUF from a URL: download, upload to Ollama, create
+          $BIN models import http://127.0.0.1:11999/files/model.gguf --name tiny-gguf --use < /dev/null
+          $BIN models | grep -q tiny-gguf
+          $BIN config | grep -q 'model = "tiny-gguf"'
           $BIN config set backend openai
           $BIN config set base_url http://127.0.0.1:11999/v1
           $BIN config set model mock-7b

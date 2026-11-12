@@ -112,6 +112,23 @@ enum ModelsCmd {
         #[arg(long, conflicts_with = "best")]
         names: bool,
     },
+    /// Import a model that isn't in the catalog: a Hugging Face GGUF repo (hf.co/owner/repo:Q4_K_M)
+    /// or a link to a .gguf file. Checks it fits first (Ollama only)
+    Import {
+        source: String,
+        /// Quantization to take from a Hugging Face repo (default Q4_K_M)
+        #[arg(long)]
+        quant: Option<String>,
+        /// Name for the model in Ollama (URL imports)
+        #[arg(long)]
+        name: Option<String>,
+        /// Make it the default model too
+        #[arg(long = "use")]
+        use_it: bool,
+        /// Download it even if it probably won't fit
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Download a recommended model: its number from `cortex models recommend`, or its name
     Install {
         target: Option<String>,
@@ -141,6 +158,7 @@ fn main() {
                 _ => models::Show::Table,
             }),
             ModelsCmd::Install { target, use_it } => models::install(&cfg, target, use_it),
+            ModelsCmd::Import { source, quant, name, use_it, yes } => models::import(&cfg, &source, quant.as_deref(), name, use_it, yes),
             ModelsCmd::Pull { name } => match models::download(&cfg, &name) {
                 Ok(()) => 0,
                 Err(e) => { eprintln!("{}", ui::error(&e)); 1 }

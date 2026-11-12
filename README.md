@@ -261,6 +261,8 @@ cortex models                   # list models on the server
 cortex models recommend         # models that suit this machine, best first (offline)
 cortex models install 1 --use   # download a recommended one (Ollama) and switch to it
 cortex models pull qwen2.5:7b   # download any Ollama model by name
+cortex models import hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M   # a GGUF from Hugging Face
+cortex models import https://example.com/model.gguf --name my-model    # or from any URL
 cortex model qwen2.5:7b         # set the default model
 cortex tools                    # list tools; cortex tools disable run_shell
 cortex tools enable fetch_url   # let the agent read web pages (turns on network access)
@@ -348,6 +350,7 @@ crates/cortex-core/src/cancel.rs    the per-session handle that stops a turn
 crates/cortex-core/src/calc.rs      calculator
 crates/cortex-core/src/hardware.rs  RAM, GPUs and their VRAM, unified memory, OS and CPU of this machine
 crates/cortex-core/src/recommend.rs which catalog models suit the hardware (a pure function)
+crates/cortex-core/src/import.rs    importing GGUFs from Hugging Face or a URL into Ollama
 crates/cortex-core/catalog.toml     the curated model catalog bundled into the binary
 crates/cortex-core/tests/session.rs drives agent turns against the fake model server
 tests/mock_server.py   fake Ollama/OpenAI server for testing without a model

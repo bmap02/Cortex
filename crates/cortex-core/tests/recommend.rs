@@ -155,3 +155,20 @@ fn ollama_only_counts_gpus_it_can_run_models_on() {
     let elsewhere = recommend(&arc, &catalog(), BackendKind::Openai).models;
     assert_eq!(elsewhere[0].fit, Fit::OnGpu);
 }
+
+#[test]
+fn an_import_gets_the_same_fit_check_from_its_file_size() {
+    use cortex_core::recommend::{check_fit, estimate_memory_gb};
+    // memory ≈ 1.1 × the file + 0.5 GB, close to the catalog's own figures
+    assert!((estimate_memory_gb(4.7) - 5.67).abs() < 0.01);
+    let nvidia_8gb = with_gpus(16.0, vec![gpu(GpuVendor::Nvidia, 8.0)]);
+    let fit = |hw: &HardwareProfile, gb: f64| { let r = check_fit(hw, gb, BackendKind::Ollama); (r.fit, r.speed) };
+    assert_eq!(fit(&nvidia_8gb, 4.7), (Fit::OnGpu, Some(Speed::Fast)));          // a 7B Q4 file
+    assert_eq!(fit(&nvidia_8gb, 9.0), (Fit::PartlyOnCpu, Some(Speed::Moderate))); // a 14B Q4 file
+    assert_eq!(fit(&nvidia_8gb, 20.0).0, Fit::DoesntFit);                        // 32B: 22.5 GB, 7.2 on the GPU, 12.8 in RAM
+    assert_eq!(fit(&ram_only(8.0), 4.7), (Fit::CpuOnly, Some(Speed::Moderate)));
+    assert_eq!(fit(&ram_only(8.0), 9.0).0, Fit::DoesntFit);
+    // the same verdict a catalog model of that size gets
+    let unified = HardwareProfile { total_ram_gb: 16.0, available_ram_gb: 8.0, unified_memory: true, gpus: Some(vec![]), os: "macos".into(), arch: "aarch64".into() };
+    assert_eq!(fit(&unified, 4.7).0, Fit::OnGpu);
+}

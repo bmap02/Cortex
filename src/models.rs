@@ -59,8 +59,7 @@ fn print_list(cfg: &Config, recs: &Recommendations, limit: usize, show_too_big: 
         let m = &r.model;
         // other servers name models differently: show what to look for there
         let shown = r.display_name(recs.can_install);
-        let fit = match r.fit { Fit::OnGpu => "fits on GPU", Fit::PartlyOnCpu => "partly on CPU", Fit::CpuOnly | Fit::DoesntFit => "CPU only" };
-        let speed = match r.speed { Some(Speed::Fast) => "fast", Some(Speed::Moderate) => "moderate", Some(Speed::Slow) | None => "slow" };
+        let (fit, speed) = (fit_label(r.fit), speed_label(r.speed));
         let params = if m.params_b < 10.0 { format!("{:.1}B", m.params_b) } else { format!("{:.0}B", m.params_b) };
         // pad before styling: escape codes would count toward the width
         let mark = if m.id == cfg.model || m.name == cfg.model { ui::bold(&format!("{:>3}", ui::DOT)) } else { ui::faint(&format!("{:>2}.", i + 1)) };
@@ -70,6 +69,14 @@ fn print_list(cfg: &Config, recs: &Recommendations, limit: usize, show_too_big: 
     if !too_big.is_empty() && show_too_big {
         println!("  {}", ui::faint(&format!("too big for this machine: {}", too_big.join(", "))));
     }
+}
+
+fn fit_label(fit: Fit) -> &'static str {
+    match fit { Fit::OnGpu => "fits on GPU", Fit::PartlyOnCpu => "partly on CPU", Fit::CpuOnly => "CPU only", Fit::DoesntFit => "doesn't fit" }
+}
+
+fn speed_label(speed: Option<Speed>) -> &'static str {
+    match speed { Some(Speed::Fast) => "fast", Some(Speed::Moderate) => "moderate", Some(Speed::Slow) => "slow", None => "" }
 }
 
 /// A one-line summary of the hardware, and a line per GPU (or why there are none).
@@ -125,21 +132,107 @@ pub fn install(cfg: &Config, target: Option<String>, use_it: bool) -> i32 {
         Err(e) => { eprintln!("{}", ui::error(&e)); return 1; }
     };
     if let Err(e) = download(cfg, &id) { eprintln!("{}", ui::error(&e)); return 1; }
+    offer_switch(cfg, &id, use_it)
+}
+
+/// Make `id` the default model: with --use, or if the user says so at a terminal.
+fn offer_switch(cfg: &Config, id: &str, use_it: bool) -> i32 {
     let switch = use_it || (cfg.model != id && std::io::stdin().is_terminal()
         && crate::ask(&format!("use {id} from now on? [Y/n]"), "y").eq_ignore_ascii_case("y"));
-    if switch {
-        match Config::update(|c| { c.model = id.clone(); Ok(()) }) {
-            Ok(()) => println!("{}", ui::muted(&format!("default model → {id}"))),
-            Err(e) => { eprintln!("{}", ui::error(&e)); return 1; }
-        }
+    if !switch { return 0; }
+    match Config::update(|c| { c.model = id.to_string(); Ok(()) }) {
+        Ok(()) => { println!("{}", ui::muted(&format!("default model → {id}"))); 0 }
+        Err(e) => { eprintln!("{}", ui::error(&e)); 1 }
     }
-    0
+}
+
+/// `cortex models import`: a GGUF from Hugging Face or a URL, after checking it will fit.
+pub fn import(cfg: &Config, source: &str, quant: Option<&str>, name: Option<String>, use_it: bool, yes: bool) -> i32 {
+    use cortex_core::import::{self, Source};
+    if cfg.backend != BackendKind::Ollama {
+        eprintln!("{}", ui::error("Cortex imports models through Ollama; you're using an OpenAI-compatible server."));
+        eprintln!("{}", ui::faint("  Download the GGUF yourself and load it in your server."));
+        return 1;
+    }
+    let src = match import::parse_source(source, quant) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("{}", ui::error(&e)); return 1; }
+    };
+    let id = match (&src, name) {
+        (Source::Url(_), Some(n)) => n,
+        (Source::HuggingFace { .. }, Some(_)) => {
+            println!("{}", ui::faint("  (--name only applies to URL imports; Ollama names Hugging Face models hf.co/...)"));
+            src.ollama_name()
+        }
+        (_, None) => src.ollama_name(),
+    };
+    // URL imports name the model themselves (Hugging Face names are hf.co/owner/repo:QUANT)
+    if matches!(src, Source::Url(_)) && !import::valid_model_name(&id) {
+        eprintln!("{}", ui::error(&format!("'{id}' can't be a model name: use letters, digits, . _ and - (optionally namespace/name:tag)")));
+        return 1;
+    }
+    if matches!(src, Source::Url(_)) && Backend::new(cfg).has_model(&id) {
+        eprintln!("{}", ui::error(&format!("there's already a model called {id}; choose another name with --name")));
+        return 1;
+    }
+    // the size, for the fit check before anything is downloaded: from Hugging Face, the server's
+    // headers, or else guessed from the file name's parameter count and quantization
+    let size = match &src {
+        Source::HuggingFace { repo, quant } => match import::hf_gguf_size(import::HF_API, repo, quant) {
+            Ok(b) => Some((b as f64 / 1e9, false)),
+            Err(e) => { eprintln!("{}", ui::error(&e)); return 1; }
+        },
+        Source::Url(url) => import::url_size(url).map(|b| (b as f64 / 1e9, false))
+            .or_else(|| import::estimate_size_gb(url.rsplit('/').next().unwrap_or(url)).map(|gb| (gb, true))),
+    };
+    if !confirm_fit(cfg, size, yes) { return 1; }
+    let result = match &src {
+        Source::HuggingFace { .. } => download(cfg, &id),
+        Source::Url(url) => import_url(cfg, url, &id),
+    };
+    if let Err(e) = result { eprintln!("{}", ui::error(&e)); return 1; }
+    offer_switch(cfg, &id, use_it)
+}
+
+/// Show the fit verdict for a file of `size` GB (and whether that was guessed from its name), and
+/// ask before going on when it won't fit. False when the user (or a script without --yes) stops.
+fn confirm_fit(cfg: &Config, size: Option<(f64, bool)>, yes: bool) -> bool {
+    let Some((gb, guessed)) = size else {
+        println!("{}", ui::faint("  Neither the server nor the file name says how big it is, so Cortex can't check that it fits."));
+        return true;
+    };
+    if guessed { println!("{}", ui::faint("  (size guessed from the file name: the server didn't say)")); }
+    let hw = cortex_core::hardware::probe();
+    let r = recommend::check_fit(&hw, gb, cfg.backend);
+    let speed = speed_label(r.speed);
+    let verdict = if speed.is_empty() { fit_label(r.fit).to_string() } else { format!("{}, {speed}", fit_label(r.fit)) };
+    println!("{}", ui::muted(&format!("  {gb:.1} GB file, about {:.1} GB to run: {verdict} on this machine", recommend::estimate_memory_gb(gb))));
+    if r.fit != Fit::DoesntFit || yes { return true; }
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{}", ui::error("It probably won't fit in this machine's memory. Add --yes to download it anyway."));
+        return false;
+    }
+    crate::ask("It probably won't fit in this machine's memory. Download it anyway? [y/N]", "n").eq_ignore_ascii_case("y")
+}
+
+/// Download a GGUF from `url` and create it in Ollama as `id`, with progress. Ctrl+C stops it.
+fn import_url(cfg: &Config, url: &str, id: &str) -> Result<(), String> {
+    let be = Backend::new(cfg);
+    println!("{}", ui::bold(&format!("Importing {id}")));
+    crate::CTRL_C.reset();
+    let mut progress = Progress::default();
+    let work = cortex_core::config::home().join("downloads");
+    let result = cortex_core::import::import_from_url(&be, url, id, &work, &crate::CTRL_C, &mut |p| progress.show(p));
+    progress.end_line();
+    result.map_err(|e| format!("couldn't import {id}: {e}"))?;
+    println!("{}", ui::muted(&format!("{id} is ready")));
+    Ok(())
 }
 
 /// Download `id` through Ollama unless it's there already, showing progress. Ctrl+C stops it.
 pub fn download(cfg: &Config, id: &str) -> Result<(), String> {
     let be = Backend::new(cfg);
-    if be.list_models().map(|m| m.iter().any(|m| m.name == id || m.name == format!("{id}:latest"))).unwrap_or(false) {
+    if be.has_model(id) {
         println!("{}", ui::muted(&format!("{id} is already downloaded")));
         return Ok(());
     }

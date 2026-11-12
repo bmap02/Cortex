@@ -174,10 +174,23 @@ impl Backend {
     /// Ollama only: download a model. `on_progress` gets each update; `cancel` stops it. Pulls
     /// are started by the user, so they aren't subject to the agent's network switch.
     pub fn pull(&self, model: &str, cancel: &CancelHandle, on_progress: &mut dyn FnMut(&PullProgress)) -> Result<(), BackendError> {
-        if self.kind != BackendKind::Ollama {
-            return Err(BackendError::Other("Cortex installs models through Ollama; load this one in your server instead".into()));
-        }
+        self.ollama_only()?;
         let resp = self.req("POST", "/api/pull").send_json(json!({"model": model, "stream": true})).map_err(Self::err)?;
+        Self::follow_status(resp, cancel, on_progress, "the download ended before it finished")
+    }
+
+    /// Ollama only: whether the server has `model` (also under its :latest tag).
+    pub fn has_model(&self, model: &str) -> bool {
+        self.list_models().map(|m| m.iter().any(|m| m.name == model || m.name == format!("{model}:latest"))).unwrap_or(false)
+    }
+
+    fn ollama_only(&self) -> Result<(), BackendError> {
+        if self.kind == BackendKind::Ollama { return Ok(()); }
+        Err(BackendError::Other("Cortex installs models through Ollama; load this one in your server instead".into()))
+    }
+
+    /// Read a streamed status reply (pull, create) to the end. Ok once Ollama says "success".
+    fn follow_status(resp: ureq::Response, cancel: &CancelHandle, on_progress: &mut dyn FnMut(&PullProgress), unfinished: &str) -> Result<(), BackendError> {
         let mut finished = false;
         for line in BufReader::new(resp.into_reader()).lines() {
             if cancel.is_cancelled() { return Err(BackendError::Other("download stopped".into())); }
@@ -188,7 +201,31 @@ impl Backend {
             finished = status == "success";
             on_progress(&PullProgress { status, completed: v["completed"].as_u64().unwrap_or(0), total: v["total"].as_u64().unwrap_or(0) });
         }
-        if finished { Ok(()) } else { Err(BackendError::Other("the download ended before it finished".into())) }
+        if finished { Ok(()) } else { Err(BackendError::Other(unfinished.into())) }
+    }
+
+    /// Ollama only: send a model file to the server as a blob (skipped if it has it already).
+    pub fn upload_blob(&self, path: &std::path::Path, sha256: &str, size: u64, cancel: &CancelHandle,
+                       on_progress: &mut dyn FnMut(&PullProgress)) -> Result<(), BackendError> {
+        self.ollama_only()?;
+        let blob = format!("/api/blobs/sha256:{sha256}");
+        if self.req("HEAD", &blob).call().is_ok() { return Ok(()); }
+        let file = std::fs::File::open(path).map_err(|e| BackendError::Other(format!("couldn't read {}: {e}", path.display())))?;
+        let reader = ProgressReader { inner: file, done: 0, total: size, cancel, on_progress };
+        self.req("POST", &blob).set("Content-Length", &size.to_string()).send(reader).map_err(|e| match e {
+            ureq::Error::Transport(_) if cancel.is_cancelled() => BackendError::Other("import stopped".into()),
+            e => Self::err(e),
+        })?;
+        Ok(())
+    }
+
+    /// Ollama only: create model `name` from an uploaded GGUF blob.
+    pub fn create_model(&self, name: &str, file_name: &str, sha256: &str, on_progress: &mut dyn FnMut(&PullProgress)) -> Result<(), BackendError> {
+        self.ollama_only()?;
+        let body = json!({"model": name, "files": {file_name: format!("sha256:{sha256}")}, "stream": true});
+        let resp = self.req("POST", "/api/create").send_json(body).map_err(Self::err)?;
+        // not cancellable: once the file is in, creating the model takes a moment and is all or nothing
+        Self::follow_status(resp, &CancelHandle::new(), on_progress, "Ollama stopped before the model was created")
     }
 
     /// Stream a chat completion. `on_text` receives text as it arrives; `cancel` ends the
@@ -352,6 +389,26 @@ impl Reply {
             on_text(t);
             self.content = t.to_string();
         }
+    }
+}
+
+/// Reads a file being uploaded, reporting progress and stopping when cancelled.
+struct ProgressReader<'a, R> {
+    inner: R,
+    done: u64,
+    total: u64,
+    cancel: &'a CancelHandle,
+    on_progress: &'a mut dyn FnMut(&PullProgress),
+}
+
+impl<R: std::io::Read> std::io::Read for ProgressReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // not ErrorKind::Interrupted: copy loops retry those, and the upload would never end
+        if self.cancel.is_cancelled() { return Err(std::io::Error::other("import stopped")); }
+        let n = self.inner.read(buf)?;
+        self.done += n as u64;
+        (self.on_progress)(&PullProgress { status: "uploading to Ollama".into(), completed: self.done, total: self.total });
+        Ok(n)
     }
 }
 

@@ -15,6 +15,7 @@ edition = "2024"
 [workspace.dependencies]
 regex = "1.13.1"
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 sysinfo = "0.40.1"
 toml = "1.2.0"
 ureq = { version = "2", features = ["json"] }
@@ -47,7 +48,7 @@ unicode-width = "0.2"
 ureq.workspace = true
 # code block highlighting; pure-Rust regex engine (no C compiler needed) and the bundled grammars/themes
 syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
-sha2 = "0.11.1"  # checks `cortex update` downloads against the release checksums
+sha2.workspace = true  # checks `cortex update` downloads against the release checksums
 
 [profile.release]
 opt-level = 3
