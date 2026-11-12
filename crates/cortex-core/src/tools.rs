@@ -1,6 +1,7 @@
 //! Built-in tools the model can call. Each has a JSON schema (sent to the model)
 //! and an implementation. Tools that change things ask for approval first.
 
+use crate::cancel::CancelHandle;
 use crate::config::{self, Config};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -112,15 +113,16 @@ pub fn preview(name: &str, a: &Value) -> Option<String> {
     }
 }
 
-pub fn execute(name: &str, a: &Value, cfg: &Config) -> String {
+/// Run a tool. `cancel` kills a shell command or Python script that is still running.
+pub fn execute(name: &str, a: &Value, cfg: &Config, cancel: &CancelHandle) -> String {
     let r = match name {
         "read_file" => read_file(a),
         "write_file" => write_file(a),
         "patch_file" => patch_file(a),
         "list_dir" => list_dir(a),
         "search_files" => search_files(a),
-        "run_shell" => run_shell(a["command"].as_str().unwrap_or(""), a["timeout_secs"].as_u64().unwrap_or(60)),
-        "run_python" => run_python(a),
+        "run_shell" => run_shell(a["command"].as_str().unwrap_or(""), a["timeout_secs"].as_u64().unwrap_or(60), cancel),
+        "run_python" => run_python(a, cancel),
         "calculator" => crate::calc::eval(a["expression"].as_str().unwrap_or(""))
             .map(|v| if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", v as i64) } else { format!("{v}") }),
         "fetch_url" if cfg.allow_network => fetch_url(a),
@@ -297,7 +299,7 @@ fn search_files(a: &Value) -> Result<String, String> {
     Ok(if hits.is_empty() { "no matches".into() } else { hits.join("\n") + if hits.len() >= 100 { "\n... (first 100 matches)" } else { "" } })
 }
 
-fn run_shell(cmd: &str, timeout: u64) -> Result<String, String> {
+fn run_shell(cmd: &str, timeout: u64, cancel: &CancelHandle) -> Result<String, String> {
     if cmd.trim().is_empty() { return Err("empty command".into()); }
     let mut c = Command::new(shell_name());
     if cfg!(windows) {
@@ -307,10 +309,10 @@ fn run_shell(cmd: &str, timeout: u64) -> Result<String, String> {
     } else {
         c.args(["-c", cmd]);
     }
-    run_process(&mut c, timeout)
+    run_process(&mut c, timeout, cancel)
 }
 
-fn run_process(c: &mut Command, timeout: u64) -> Result<String, String> {
+fn run_process(c: &mut Command, timeout: u64, cancel: &CancelHandle) -> Result<String, String> {
     let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
     let mut so = child.stdout.take().unwrap();
     let mut se = child.stderr.take().unwrap();
@@ -320,7 +322,7 @@ fn run_process(c: &mut Command, timeout: u64) -> Result<String, String> {
     let start = Instant::now();
     let status = loop {
         if let Some(st) = child.try_wait().map_err(|e| e.to_string())? { break Some(st); }
-        if start.elapsed() > Duration::from_secs(timeout) || crate::backend::INTERRUPT.load(std::sync::atomic::Ordering::SeqCst) {
+        if start.elapsed() > Duration::from_secs(timeout) || cancel.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -339,12 +341,12 @@ fn run_process(c: &mut Command, timeout: u64) -> Result<String, String> {
     Ok(if s.trim().is_empty() { "(no output)".into() } else { s })
 }
 
-fn run_python(a: &Value) -> Result<String, String> {
+fn run_python(a: &Value, cancel: &CancelHandle) -> Result<String, String> {
     let code = arg(a, "code")?;
     let path = std::env::temp_dir().join(format!("cortex_{}.py", std::process::id()));
     std::fs::write(&path, code).map_err(|e| e.to_string())?;
     let py = python_exe().ok_or("Python isn't installed (tried python3, python, py)")?;
-    let r = run_process(Command::new(py).arg(&path).env("PYTHONIOENCODING", "utf-8"), 60);
+    let r = run_process(Command::new(py).arg(&path).env("PYTHONIOENCODING", "utf-8"), 60, cancel);
     let _ = std::fs::remove_file(&path);
     r
 }
@@ -473,9 +475,9 @@ mod tests {
     }
     #[test]
     fn shell_runs_and_times_out() {
-        assert!(run_shell("echo hi", 5).unwrap().contains("hi"));
+        assert!(run_shell("echo hi", 5, &CancelHandle::new()).unwrap().contains("hi"));
         let sleep = if cfg!(windows) { "Start-Sleep -Seconds 3" } else { "sleep 3" };
-        assert!(run_shell(sleep, 1).unwrap().contains("killed"));
+        assert!(run_shell(sleep, 1, &CancelHandle::new()).unwrap().contains("killed"));
     }
     #[test]
     fn home_expansion() {

@@ -333,20 +333,23 @@ disabled_tools = []
 
 ```
 src/main.rs      the `cortex` CLI: interactive loop, slash commands, setup & doctor
-crates/cortex-core/              the core library the CLI is built on:
-crates/cortex-core/src/agent.rs     agent loop, sessions, memory, compression
+src/turn.rs      shows an agent turn: streamed reply, tool lines, approval prompt, stats
+src/ui.rs        banner, colors, status line
+src/markdown.rs  streaming Markdown rendering for replies
+crates/cortex-core/              the core library the CLI is built on (never prints):
+crates/cortex-core/src/agent.rs     agent loop on a worker thread, its events, sessions, compression
 crates/cortex-core/src/backend.rs   Ollama + OpenAI-compatible streaming clients
 crates/cortex-core/src/tools.rs     tool schemas and implementations
 crates/cortex-core/src/config.rs    settings and the Cortex home folder
+crates/cortex-core/src/cancel.rs    the per-session handle that stops a turn
 crates/cortex-core/src/calc.rs      calculator
-crates/cortex-core/src/ui.rs        banner, colors, status line
-crates/cortex-core/src/markdown.rs  streaming Markdown rendering for replies
+crates/cortex-core/tests/session.rs drives agent turns against the fake model server
 tests/mock_server.py   fake Ollama/OpenAI server for testing without a model
 install.sh / install.ps1   one-line installers (download a release)
 install-windows.cmd/.ps1   all-in-one Windows installer (builds from source)
 .github/workflows/     CI on Windows, macOS & Linux; release builds on version tags```
 
-Run the tests with `cargo test`. For an end-to-end check without a GPU, start
+Run the tests with `cargo test` (the core's session tests need Python, for the fake model server). For an end-to-end check without a GPU, start
 `python3 tests/mock_server.py 11999` and point Cortex at `http://127.0.0.1:11999` (Ollama) or
 `http://127.0.0.1:11999/v1` (OpenAI).
 

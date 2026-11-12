@@ -1,14 +1,10 @@
 //! The Cortex core: the agent loop, model backends, tools, config, the calculator and sessions,
-//! shared by the Cortex front-ends.
-//!
-//! `ui` and `markdown` are terminal rendering. They live here only because the agent loop still
-//! prints as it runs; they move to the CLI with the event-driven agent loop
-//! (`.scratch/cortex-roadmap/issues/02-event-driven-agent-loop.md`).
+//! shared by the Cortex front-ends. It never prints or reads stdin during a turn: a turn reports
+//! what happens as events (see [`agent`]) and front-ends do the presenting.
 
 pub mod agent;
 pub mod backend;
 pub mod calc;
+pub mod cancel;
 pub mod config;
-pub mod markdown;
 pub mod tools;
-pub mod ui;

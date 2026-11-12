@@ -4,6 +4,8 @@ Scripted behaviour: if the last message is from the user, ask for a tool call
 (calculator for math questions, write_file when asked to write a file); after a
 tool result comes back, stream a final answer that quotes the result. A prompt
 containing "loop" repeats the same calculator call until Cortex refuses to rerun it.
+"write to <path>" asks to write that file; "slow" streams a long answer slowly (for stopping).
+Port 0 picks a free port and prints "PORT <n>" first, for tests that run several servers at once.
 """
 import json, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,8 +24,11 @@ def decide(messages):
         return ("text", para * 2 + "\n\nWide characters: 日本語テキスト and emoji 🚀🔥 count as two columns.\n" + "\n".join(f"- item {i}" for i in range(8)))
     if "huge" in text:
         return ("text", "\n".join(f"line {i}" for i in range(80)))
+    if "slow" in text:
+        return ("text", " ".join(f"word{i}" for i in range(200)))
     if "write" in text:
-        return ("tool", "write_file", {"path": "out/hello.txt", "content": "hello from cortex\n"})
+        path = last["content"].split("write to ", 1)[1].strip() if "write to " in text else "out/hello.txt"
+        return ("tool", "write_file", {"path": path, "content": "hello from cortex\n"})
     if any(c.isdigit() for c in text):
         return ("tool", "calculator", {"expression": "1234 * 5678"})
     return ("text", "Hi! I'm a mock model running locally.")
@@ -60,7 +65,7 @@ class H(BaseHTTPRequestHandler):
                 for w in d[1].split(" "):
                     if w == "": continue
                     self.wfile.write((json.dumps({"message": {"role": "assistant", "content": w + " "}, "done": False}) + "\n").encode())
-                    self.wfile.flush(); time.sleep(0.01)
+                    self.wfile.flush(); time.sleep(0.05 if w.startswith("word") else 0.01)
             self.wfile.write((json.dumps({"message": {"role": "assistant", "content": ""}, "done": True,
                                           "prompt_eval_count": 321, "eval_count": 40, "eval_duration": 1_000_000_000}) + "\n").encode())
         elif self.path == "/v1/chat/completions":
@@ -80,4 +85,6 @@ class H(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 11999), H).serve_forever()
+    server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 11999), H)
+    print(f"PORT {server.server_address[1]}", flush=True)
+    server.serve_forever()

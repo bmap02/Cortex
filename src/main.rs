@@ -1,8 +1,13 @@
 //! Cortex: a lightweight, fully local AI agent for the terminal.
 
-use cortex_core::{agent, backend, config, tools, ui};
+mod markdown;
+mod turn;
+mod ui;
+
+use cortex_core::{agent, backend, config, tools};
 use agent::Agent;
-use backend::{Backend, INTERRUPT};
+use backend::Backend;
+use cortex_core::cancel::CancelHandle;
 use clap::{Parser, Subcommand};
 use config::{BackendKind, Config};
 use rustyline::completion::{Completer, Pair};
@@ -12,7 +17,16 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
 use std::io::{IsTerminal, Read, Write};
-use std::sync::atomic::Ordering;
+use std::sync::LazyLock;
+
+/// What Ctrl-C stops: the turn in progress (every agent this process makes shares it).
+static CTRL_C: LazyLock<CancelHandle> = LazyLock::new(CancelHandle::new);
+
+fn new_agent(cfg: Config) -> Agent {
+    let mut a = Agent::new(cfg);
+    a.cancel = CTRL_C.clone();
+    a
+}
 
 #[derive(Parser)]
 #[command(name = "cortex", version, about = "A lightweight, fully local AI agent for your terminal")]
@@ -91,7 +105,7 @@ enum ModelsCmd {
 
 fn main() {
     let cli = Cli::parse();
-    let _ = ctrlc::set_handler(|| INTERRUPT.store(true, Ordering::SeqCst));
+    let _ = ctrlc::set_handler(|| CTRL_C.cancel());
     let mut cfg = Config::load();
     if let Some(m) = &cli.model { cfg.model = m.clone(); }
     if let Some(n) = cli.ctx { cfg.num_ctx = n; }
@@ -286,7 +300,7 @@ fn chat(cfg: Config, resume: Option<String>) {
         setup();
         return chat(Config::load(), resume);
     }
-    let mut agent = Agent::new(cfg);
+    let mut agent = new_agent(cfg);
     if let Some(id) = resume {
         match agent::load_session(&id) {
             Some(s) => { println!("{}", ui::muted(&format!("resumed session {} ({} messages)", s.id, s.messages.len()))); agent.resume(s) }
@@ -330,7 +344,7 @@ fn chat(cfg: Config, resume: Option<String>) {
             if !slash(&mut agent, &input) { break; }
             continue;
         }
-        if let Err(e) = agent.send(&input, false) { println!("{}", ui::error(&format!("✗ {e}"))); }
+        if let Err(e) = turn::send(&mut agent, &input, false) { println!("{}", ui::error(&format!("✗ {e}"))); }
     }
     let _ = rl.save_history(&config::history_path());
     agent.save();
@@ -367,7 +381,7 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
         "/models" => { print_models(&agent.cfg); }
         "/tools" => print_tools(&agent.cfg),
         "/retry" => match agent.undo() {
-            Some(t) => if let Err(e) = agent.send(&t, false) { println!("{}", ui::error(&format!("✗ {e}"))) },
+            Some(t) => if let Err(e) = turn::send(agent, &t, false) { println!("{}", ui::error(&format!("✗ {e}"))) },
             None => println!("{}", ui::muted("nothing to retry")),
         },
         "/undo" => match agent.undo() {
@@ -434,16 +448,16 @@ fn run_once(cfg: Config, prompt: String, quiet: bool, no_tools: bool) -> i32 {
         if !piped.trim().is_empty() { prompt = format!("{prompt}\n\n```\n{}\n```", piped.trim_end()); }
     }
     if prompt.trim().is_empty() { eprintln!("usage: cortex run \"your prompt\""); return 2; }
-    let mut agent = Agent::new(cfg);
+    let mut agent = new_agent(cfg);
     if no_tools { agent.tools_supported = false; }
     // in one-shot mode nobody can answer approval prompts on a pipe
     if !std::io::stdin().is_terminal() && !agent.approve_all {
         agent.cfg.disabled_tools.extend(tools::all().iter().filter(|t| t.needs_approval).map(|t| t.name.to_string()));
     }
     if quiet {
-        return match agent.send(&prompt, true) { Ok(_) => { println!(); 0 } Err(e) => { eprintln!("{e}"); 1 } };
+        return match turn::send(&mut agent, &prompt, true) { Ok(_) => { println!(); 0 } Err(e) => { eprintln!("{e}"); 1 } };
     }
-    match agent.send(&prompt, false) { Ok(_) => 0, Err(e) => { eprintln!("{}", ui::error(&format!("✗ {e}"))); 1 } }
+    match turn::send(&mut agent, &prompt, false) { Ok(_) => 0, Err(e) => { eprintln!("{}", ui::error(&format!("✗ {e}"))); 1 } }
 }
 
 // ---------------------------------------------------------------- setup & management
@@ -799,7 +813,8 @@ fn doctor(cfg: &Config) -> i32 {
     let _ = std::io::stdout().flush();
     let msgs = vec![backend::Msg::new("user", "What is 1234 * 5678? Use the calculator tool.")];
     let calc = tools::find("calculator").map(|t| vec![t.schema()]).unwrap_or_default();
-    match be.chat(cfg, &cfg.model, &msgs, &calc, &mut |_| {}) {
+    CTRL_C.reset();
+    match be.chat(cfg, &cfg.model, &msgs, &calc, &CTRL_C, &mut |_| {}) {
         Ok(r) if !r.tool_calls.is_empty() => { println!(); ok(&format!("tool calling works ({:.0} tok/s)", r.usage.tok_per_s)) }
         Ok(r) => { println!(); ok(&format!("chat works ({:.0} tok/s)", r.usage.tok_per_s)); bad("model answered without calling the tool; agent features may be unreliable with this model") }
         Err(backend::BackendError::ToolsUnsupported(_)) => { println!(); bad("this model doesn't support tool calling (chat still works). Try qwen2.5, llama3.1+, mistral-nemo") }

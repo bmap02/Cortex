@@ -2,14 +2,12 @@
 //! - Ollama native: POST {base}/api/chat, newline-delimited JSON stream
 //! - OpenAI-compatible: POST {base}/chat/completions, server-sent events
 
+use crate::cancel::CancelHandle;
 use crate::config::{BackendKind, Config};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
-pub static INTERRUPT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -186,25 +184,25 @@ impl Backend {
         Ok(())
     }
 
-    /// Stream a chat completion. `on_text` receives text as it arrives.
-    pub fn chat(&self, cfg: &Config, model: &str, msgs: &[Msg], tools: &[Value], on_text: &mut dyn FnMut(&str)) -> Result<Reply, BackendError> {
-        INTERRUPT.store(false, Ordering::SeqCst);
+    /// Stream a chat completion. `on_text` receives text as it arrives; `cancel` ends the
+    /// stream early (the reply comes back marked `interrupted`).
+    pub fn chat(&self, cfg: &Config, model: &str, msgs: &[Msg], tools: &[Value], cancel: &CancelHandle, on_text: &mut dyn FnMut(&str)) -> Result<Reply, BackendError> {
         // Some models now and then write a tool call the server can't parse; another sample usually works.
         const ATTEMPTS: usize = 3;
         for attempt in 1..=ATTEMPTS {
             let result = match self.kind {
-                BackendKind::Ollama => self.chat_ollama(cfg, model, msgs, tools, on_text),
-                BackendKind::Openai => self.chat_openai(cfg, model, msgs, tools, on_text),
+                BackendKind::Ollama => self.chat_ollama(cfg, model, msgs, tools, cancel, on_text),
+                BackendKind::Openai => self.chat_openai(cfg, model, msgs, tools, cancel, on_text),
             };
             match result {
-                Err(BackendError::Other(m)) if attempt < ATTEMPTS && is_tool_parse_error(&m) && !INTERRUPT.load(Ordering::SeqCst) => continue,
+                Err(BackendError::Other(m)) if attempt < ATTEMPTS && is_tool_parse_error(&m) && !cancel.is_cancelled() => continue,
                 other => return other,
             }
         }
         unreachable!("the last attempt always returns")
     }
 
-    fn chat_ollama(&self, cfg: &Config, model: &str, msgs: &[Msg], tools: &[Value], on_text: &mut dyn FnMut(&str)) -> Result<Reply, BackendError> {
+    fn chat_ollama(&self, cfg: &Config, model: &str, msgs: &[Msg], tools: &[Value], cancel: &CancelHandle, on_text: &mut dyn FnMut(&str)) -> Result<Reply, BackendError> {
         let messages: Vec<Value> = msgs.iter().map(|m| {
             let mut o = json!({"role": m.role, "content": m.content});
             if !m.tool_calls.is_empty() {
@@ -224,7 +222,7 @@ impl Backend {
         let mut reply = Reply::default();
         let mut thinking = String::new();
         for line in BufReader::new(resp.into_reader()).lines() {
-            if INTERRUPT.load(Ordering::SeqCst) { reply.interrupted = true; break; }
+            if cancel.is_cancelled() { reply.interrupted = true; break; }
             let line = line.map_err(|e| BackendError::Other(e.to_string()))?;
             if line.trim().is_empty() { continue; }
             let v: Value = serde_json::from_str(&line).map_err(|e| BackendError::Other(format!("bad stream chunk: {e}")))?;
@@ -257,7 +255,7 @@ impl Backend {
         Ok(reply)
     }
 
-    fn chat_openai(&self, cfg: &Config, model: &str, msgs: &[Msg], tools: &[Value], on_text: &mut dyn FnMut(&str)) -> Result<Reply, BackendError> {
+    fn chat_openai(&self, cfg: &Config, model: &str, msgs: &[Msg], tools: &[Value], cancel: &CancelHandle, on_text: &mut dyn FnMut(&str)) -> Result<Reply, BackendError> {
         let messages: Vec<Value> = msgs.iter().map(|m| {
             let mut o = json!({"role": m.role, "content": m.content});
             if !m.tool_calls.is_empty() {
@@ -286,7 +284,7 @@ impl Backend {
         let mut thinking = String::new();
 
         for line in BufReader::new(resp.into_reader()).lines() {
-            if INTERRUPT.load(Ordering::SeqCst) { reply.interrupted = true; break; }
+            if cancel.is_cancelled() { reply.interrupted = true; break; }
             let line = line.map_err(|e| BackendError::Other(e.to_string()))?;
             let Some(data) = line.strip_prefix("data:") else { continue };
             let data = data.trim();

@@ -1,12 +1,18 @@
 //! The agent loop: send the conversation, stream the reply, run any tool calls,
 //! feed results back, repeat until the model answers without tools.
 
-use crate::backend::{Backend, BackendError, Msg, Usage, INTERRUPT};
+//!
+//! A turn runs on a worker thread and reports what happens as [`Event`]s; the core itself never
+//! prints or reads stdin. Front-ends render the events, answer [`ApprovalRequest`]s and stop a
+//! turn through the session's [`CancelHandle`].
+
+use crate::backend::{Backend, BackendError, Msg, Usage};
+use crate::cancel::CancelHandle;
 use crate::config::{self, Config};
-use crate::markdown::Markdown;
-use crate::{tools, ui};
+use crate::tools;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize)]
 pub struct Session {
@@ -112,6 +118,84 @@ pub struct Agent {
     pub last: Usage,
     pub total_prompt: usize,
     pub total_completion: usize,
+    /// Stops the turn in progress; the front-end sets it (Ctrl-C, a Stop button).
+    pub cancel: CancelHandle,
+}
+
+/// What happens during a turn, in order. The last event is always [`Event::Done`] or [`Event::Error`].
+pub enum Event {
+    /// The conversation is nearly as long as the context window: earlier turns are being summarized.
+    Compressing,
+    /// The model can't call tools (the server's message); the turn carries on as plain chat.
+    PlainChatFallback(String),
+    /// The next piece of the model's reply, as received (may contain control characters).
+    Text(String),
+    /// The model's reply for this step is complete, or was stopped. A reply that fails ends the
+    /// turn with [`Event::Error`] instead.
+    ReplyEnd,
+    /// A tool call is starting. `description` says what it does, e.g. "1234 * 5678" for the calculator.
+    ToolStarted { name: String, description: String },
+    /// A tool call identical to one in the previous step: not run again.
+    ToolSkipped { name: String, description: String },
+    /// A tool call needs the user's OK before it runs.
+    ApprovalRequest(ApprovalRequest),
+    /// The tool call that last started has finished with this result (what the model sees).
+    ToolFinished { result: String },
+    /// Token counts and speed for one model reply.
+    Usage(Usage),
+    /// The turn ended before the model finished answering.
+    Stopped(StopReason),
+    /// The turn is over; `text` is the model's last reply.
+    Done { text: String, stats: TurnStats },
+    /// The turn failed; the user's message was taken back out of the conversation.
+    Error(String),
+}
+
+/// Why a turn stopped early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The cancel handle was set.
+    Cancelled,
+    /// The user declined a tool call: control goes back to them.
+    Declined,
+    /// The model kept repeating the same tool call.
+    Repeating,
+    /// The model used up the maximum number of tool rounds for one message.
+    StepLimit(usize),
+}
+
+/// The context and speed figures for the status line at the end of a turn.
+#[derive(Debug, Clone, Copy)]
+pub struct TurnStats {
+    pub ctx_used: usize,
+    pub ctx_max: usize,
+    pub tok_per_s: f64,
+    /// Tool calls that ran (repeats that were skipped don't count).
+    pub tool_calls: usize,
+}
+
+/// A request to run a tool. Answer it with [`ApprovalRequest::answer`]; dropping it unanswered
+/// counts as [`Approval::Deny`]. The turn waits until one of the two happens, or until it is
+/// cancelled, which also denies it (a request kept after that is simply ignored).
+pub struct ApprovalRequest {
+    pub name: String,
+    /// What the call does, as in [`Event::ToolStarted`].
+    pub description: String,
+    /// Exactly what will run or change, when the one-line description doesn't show all of it.
+    pub preview: Option<String>,
+    reply: Sender<Approval>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    AllowOnce,
+    /// Allow this and every later tool call in this session without asking.
+    AllowAlways,
+    Deny,
+}
+
+impl ApprovalRequest {
+    pub fn answer(self, a: Approval) { let _ = self.reply.send(a); }
 }
 
 pub fn system_prompt(cfg: &Config) -> String {
@@ -151,6 +235,7 @@ impl Agent {
             last: Usage::default(),
             total_prompt: 0,
             total_completion: 0,
+            cancel: CancelHandle::new(),
             backend,
             cfg,
         }
@@ -187,35 +272,51 @@ impl Agent {
         if reported > 0 { reported } else { self.ctx_estimate() }
     }
 
-    /// Ask a y/n/always question on stdin.
-    fn approve(&mut self, preview: Option<String>) -> bool {
+    /// Wait for the front-end's answer to a tool call that needs approval.
+    fn approve(&mut self, name: &str, description: &str, preview: Option<String>, emit: &impl Fn(Event)) -> bool {
         if self.approve_all { return true; }
-        if let Some(p) = preview {
-            for l in ui::clean(&p).lines() { ui::outln(&format!("    {}", ui::faint(l))); }
-        }
-        let sep = ui::muted(" / ");
-        ui::out(&format!("  {} {}{sep}{}{sep}{} ", ui::bold("allow?"),
-            ui::paint("[y]es", ui::OK, false), ui::paint("[n]o", ui::ERR, false), ui::paint("[a]lways this session", ui::WARN, false)));
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() { return false; }
-        ui::feed(if line.ends_with('\n') { &line } else { "\n" }); // the user's typed answer + Enter
-        match line.trim().to_lowercase().as_str() {
-            "y" | "yes" => true,
-            "a" | "always" => { self.approve_all = true; true }
-            _ => false,
+        let (reply, answer) = mpsc::channel();
+        emit(Event::ApprovalRequest(ApprovalRequest { name: name.into(), description: description.into(), preview, reply }));
+        loop {
+            match answer.recv_timeout(Duration::from_millis(100)) {
+                Ok(Approval::AllowOnce) => return true,
+                Ok(Approval::AllowAlways) => { self.approve_all = true; return true }
+                Ok(Approval::Deny) | Err(RecvTimeoutError::Disconnected) => return false,
+                // a Stop pressed while a dialog is still open
+                Err(RecvTimeoutError::Timeout) if self.cancel.is_cancelled() => return false,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
         }
     }
 
-    /// Run one user turn. `quiet` suppresses tool chatter (for `cortex run -q`).
-    pub fn send(&mut self, text: &str, quiet: bool) -> Result<String, String> {
+    /// Run one user turn on a worker thread. `on_event` gets every [`Event`] on the calling thread
+    /// as it happens and must answer (or drop) each [`ApprovalRequest`]. Returns the model's last
+    /// reply, or the error that ended the turn.
+    pub fn send(&mut self, text: &str, mut on_event: impl FnMut(Event)) -> Result<String, String> {
         if self.model.is_empty() {
-            return Err("no model selected. Run `cortex setup` or `/model <name>`.".into());
+            let e = "no model selected. Run `cortex setup` or `/model <name>`.".to_string();
+            on_event(Event::Error(e.clone()));
+            return Err(e);
         }
+        self.cancel.reset(); // a stop meant for an earlier turn doesn't carry over
         self.msgs.push(Msg::new("user", text));
-        self.run_loop(quiet)
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                let emit = |e: Event| { let _ = tx.send(e); };
+                let result = self.run_loop(&emit);
+                emit(match &result {
+                    Ok((text, stats)) => Event::Done { text: text.clone(), stats: *stats },
+                    Err(e) => Event::Error(e.clone()),
+                });
+                result.map(|(text, _)| text)
+            });
+            for e in rx { on_event(e); }
+            worker.join().unwrap_or_else(|_| Err("the agent stopped unexpectedly".into()))
+        })
     }
 
-    fn run_loop(&mut self, quiet: bool) -> Result<String, String> {
+    fn run_loop(&mut self, emit: &impl Fn(Event)) -> Result<(String, TurnStats), String> {
         let mut tool_calls_made = 0;
         let mut final_text = String::new();
         // Small models sometimes repeat the exact call they just made instead of using its result.
@@ -223,34 +324,27 @@ impl Agent {
         // still fine: the edit comes in between); two such steps in a row end the turn.
         let mut prev_calls: Vec<(String, String)> = vec![];
         let mut repeat_steps = 0;
-        if !quiet { println!("\n{}", ui::reply_header(&self.model)); ui::track_start(); }
         for step in 0..self.cfg.max_steps.max(1) {
             if self.ctx_used() > self.cfg.num_ctx * 85 / 100 && self.msgs.len() > 6 {
-                if !quiet { ui::outln(&ui::faint("  (context nearly full: compressing earlier conversation)")); }
+                emit(Event::Compressing);
                 if let Err(e) = self.compress() { self.msgs.pop_if_user(); return Err(e); }
             }
             let schemas = if self.tools_supported { tools::schemas(&self.cfg) } else { vec![] };
-            let mut printed_any = false;
-            let mut md = Markdown::for_terminal();
-            let mut on_text = |t: &str| {
-                // text right under the header; a blank line when it follows tool output
-                if !printed_any { if !quiet && step > 0 { ui::out("\n"); } printed_any = true; }
-                ui::out(&md.push(&ui::clean(t)));
-            };
-            let result = match self.backend.chat(&self.cfg, &self.model, &self.msgs, &schemas, &mut on_text) {
+            let mut on_text = |t: &str| emit(Event::Text(t.to_string()));
+            let result = match self.backend.chat(&self.cfg, &self.model, &self.msgs, &schemas, &self.cancel, &mut on_text) {
                 Err(BackendError::ToolsUnsupported(m)) if self.tools_supported => {
                     self.tools_supported = false;
-                    if !quiet { ui::outln(&ui::faint(&format!("  ({}: {m}. Continuing as plain chat; pick a tool-capable model for agent features.)", self.model))); }
-                    self.backend.chat(&self.cfg, &self.model, &self.msgs, &[], &mut on_text)
+                    emit(Event::PlainChatFallback(m));
+                    self.backend.chat(&self.cfg, &self.model, &self.msgs, &[], &self.cancel, &mut on_text)
                 }
                 other => other,
             };
-            ui::out(&md.finish()); // print anything held back and reset styles, even after an error
             let reply = match result {
                 Ok(r) => r,
                 Err(e) => { self.msgs.pop_if_user(); return Err(e.to_string()); }
             };
-            if !reply.content.is_empty() { ui::out("\n"); }
+            emit(Event::ReplyEnd);
+            emit(Event::Usage(reply.usage));
             // a stopped reply never gets its token counts; keep the last real ones for the stats line
             if reply.usage.prompt_tokens + reply.usage.completion_tokens > 0 { self.last = reply.usage; }
             self.total_prompt += reply.usage.prompt_tokens;
@@ -262,7 +356,7 @@ impl Agent {
             final_text = reply.content;
 
             if reply.interrupted {
-                ui::outln(&ui::faint("  [stopped]"));
+                emit(Event::Stopped(StopReason::Cancelled));
                 // an interrupted tool request can't be answered; drop the calls
                 if let Some(last) = self.msgs.last_mut() { last.tool_calls.clear(); }
                 break;
@@ -278,58 +372,52 @@ impl Agent {
                     self.msgs.push(Msg::tool_result(call, "Skipped: the user declined an earlier action in this step.".into()));
                     continue;
                 }
-                // the tool name and arguments come from the model: shown without control characters
-                let label = ui::clean(&format!("{}: {}", call.name, tools::describe(&call.name, &call.args)));
+                if self.cancel.is_cancelled() {
+                    // stopped mid-step: the calls not run yet still need a result
+                    self.msgs.push(Msg::tool_result(call, "Skipped: the user stopped this step.".into()));
+                    continue;
+                }
+                let description = tools::describe(&call.name, &call.args);
                 if prev_calls.contains(&(call.name.clone(), call.args.to_string())) {
-                    if !quiet { ui::outln(&format!("  {} {}", ui::paint(ui::TOOL_MARK, ui::WHITE, true), ui::faint(&ui::truncate(&format!("{label}  (skipped: same as the previous step)"), 110)))); }
+                    emit(Event::ToolSkipped { name: call.name.clone(), description });
                     self.msgs.push(Msg::tool_result(call, REPEAT_NOTE.into()));
                     continue;
                 }
                 only_repeats = false;
                 tool_calls_made += 1;
-                if !quiet { ui::outln(&format!("  {} {}", ui::paint(ui::TOOL_MARK, ui::WHITE, true), ui::muted(&ui::truncate(&label, 110)))); }
+                emit(Event::ToolStarted { name: call.name.clone(), description: description.clone() });
                 let tool = tools::find(&call.name);
                 let result = match &tool {
                     None => format!("ERROR: unknown tool '{}'", call.name),
                     Some(t) if !t.enabled(&self.cfg) => format!("ERROR: tool '{}' is disabled", call.name),
-                    Some(t) if t.needs_approval && !self.approve(tools::preview(&call.name, &call.args)) => {
+                    Some(t) if t.needs_approval && !self.approve(&call.name, &description, tools::preview(&call.name, &call.args), emit) => {
                         declined = true;
                         "The user declined this action. Do not retry it or try a workaround; wait for their instructions.".to_string()
                     }
-                    Some(_) => tools::execute(&call.name, &call.args, &self.cfg),
+                    Some(_) => tools::execute(&call.name, &call.args, &self.cfg, &self.cancel),
                 };
-                if !quiet {
-                    let shown = ui::clean(&result);
-                    let lines: Vec<&str> = shown.lines().collect();
-                    for l in lines.iter().take(4) { ui::outln(&format!("    {}", ui::faint(&ui::truncate(l, 110)))); }
-                    if lines.len() > 4 { ui::outln(&format!("    {}", ui::faint(&format!("… {} more lines", lines.len() - 4)))); }
-                }
+                emit(Event::ToolFinished { result: result.clone() });
                 self.msgs.push(Msg::tool_result(call, result));
-                if INTERRUPT.load(Ordering::SeqCst) { break; }
             }
-            if INTERRUPT.load(Ordering::SeqCst) { ui::outln(&ui::faint("  [stopped]")); break; }
+            if self.cancel.is_cancelled() { emit(Event::Stopped(StopReason::Cancelled)); break; }
             if declined {
                 // hand control back to the user instead of letting the model try something else
-                ui::outln(&ui::faint("  (stopped: tell Cortex what you'd like instead)"));
+                emit(Event::Stopped(StopReason::Declined));
                 break;
             }
             prev_calls = this_step;
             repeat_steps = if only_repeats { repeat_steps + 1 } else { 0 };
             if repeat_steps >= 2 {
-                ui::outln(&ui::faint("  (stopped: the model kept repeating the same action)"));
+                emit(Event::Stopped(StopReason::Repeating));
                 break;
             }
             if step + 1 == self.cfg.max_steps {
-                ui::outln(&ui::faint(&format!("  (stopped after {} tool rounds; say \"continue\" to keep going)", self.cfg.max_steps)));
+                emit(Event::Stopped(StopReason::StepLimit(self.cfg.max_steps)));
             }
         }
-        if !quiet {
-            let stats = ui::status_line(self.ctx_used(), self.cfg.num_ctx, self.last.tok_per_s, tool_calls_made);
-            // put the stats next to the model name; if that line has scrolled away, print them below
-            if !ui::finish_header(&self.model, &stats) { println!("\n  {stats}"); }
-        }
         self.save();
-        Ok(final_text)
+        let stats = TurnStats { ctx_used: self.ctx_used(), ctx_max: self.cfg.num_ctx, tok_per_s: self.last.tok_per_s, tool_calls: tool_calls_made };
+        Ok((final_text, stats))
     }
 
     /// Replace the earlier conversation with a model-written summary. The latest user turn
@@ -339,7 +427,9 @@ impl Agent {
         let split = compress_split(&self.msgs);
         let mut req = self.msgs[..split].to_vec();
         req.push(Msg::new("user", "Summarize our conversation so far for your own future reference: the user's goals, key facts, decisions, files touched and anything still open. Be dense; bullet points."));
-        let r = self.backend.chat(&self.cfg, &self.model, &req, &[], &mut |_| {}).map_err(|e| e.to_string())?;
+        let r = self.backend.chat(&self.cfg, &self.model, &req, &[], &self.cancel, &mut |_| {}).map_err(|e| e.to_string())?;
+        // a summary cut short would replace the conversation with part of one
+        if r.interrupted { return Err("stopped while compressing the conversation; nothing was changed".into()); }
         let mut tail = self.msgs.split_off(split);
         // Everything was summarized but a request is still being worked on (the last message is the
         // user's or a tool result): repeat the request so the model still has something to answer.

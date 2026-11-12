@@ -13,6 +13,7 @@ edition = "2024"
 
 # only the crates both packages use; the rest stay in their own package
 [workspace.dependencies]
+regex = "1.13.1"
 serde_json = "1.0.154"
 toml = "1.2.0"
 ureq = { version = "2", features = ["json"] }
@@ -34,11 +35,17 @@ edition.workspace = true
 cortex-core = { path = "crates/cortex-core" }
 clap = { version = "4.6.7", features = ["derive"] }
 ctrlc = "3.5.2"
+enable-ansi-support = "0.2"  # turns on ANSI colors in Windows consoles; no-op elsewhere
+regex.workspace = true
 rustyline = "19.0.0"
 serde_json.workspace = true
 sysinfo = "0.40.1"
+terminal_size = "0.4.4"
 toml.workspace = true
+unicode-width = "0.2"
 ureq.workspace = true
+# code block highlighting; pure-Rust regex engine (no C compiler needed) and the bundled grammars/themes
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 
 [profile.release]
 opt-level = 3

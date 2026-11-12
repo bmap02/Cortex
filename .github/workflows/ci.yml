@@ -55,10 +55,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # --locked: fail here if Cargo.lock is out of date (the release build would fail later)
       - run: cargo clippy --locked --all-targets -- -D clippy::correctness
-      - run: cargo test --locked
+      # the core's session tests and the end-to-end check below run tests/mock_server.py
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: cargo test --locked
       # GitHub's macOS runners can hold back connections to a freshly started Python server
       # behind the application firewall; it's a throwaway test machine, so switch it off.
       - name: Allow local connections (macOS)
