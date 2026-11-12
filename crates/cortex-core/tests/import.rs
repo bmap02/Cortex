@@ -127,3 +127,22 @@ fn stopping_during_the_upload_ends_promptly_without_a_model() {
 }
 
 fn files_in(dir: &std::path::Path) -> usize { std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0) }
+
+#[test]
+fn downloads_go_next_to_ollamas_models_when_ollama_is_on_this_machine() {
+    use cortex_core::import::download_dir;
+    let home = std::env::temp_dir().join(format!("cortex_dl_home{}", std::process::id()));
+    let ollama = home.join(".ollama").join("models");
+    std::fs::create_dir_all(&ollama).unwrap();
+    let fallback = home.join(".cortex").join("downloads");
+    let local = "http://localhost:11434";
+    // Ollama's default folder, or the one OLLAMA_MODELS points to
+    assert_eq!(download_dir(local, None, Some(&home), &fallback), ollama.join("cortex-import"));
+    let moved = home.join("D-drive").join("models");
+    std::fs::create_dir_all(&moved).unwrap();
+    assert_eq!(download_dir("http://127.0.0.1:11434", Some(moved.to_str().unwrap()), Some(&home), &fallback), moved.join("cortex-import"));
+    // Ollama on another machine, or no Ollama folder here: Cortex's own folder
+    assert_eq!(download_dir("http://192.168.1.20:11434", None, Some(&home), &fallback), fallback);
+    assert_eq!(download_dir(local, None, Some(&home.join("nobody")), &fallback), fallback);
+    let _ = std::fs::remove_dir_all(&home);
+}

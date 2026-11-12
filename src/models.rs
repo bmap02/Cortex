@@ -221,8 +221,13 @@ fn import_url(cfg: &Config, url: &str, id: &str) -> Result<(), String> {
     println!("{}", ui::bold(&format!("Importing {id}")));
     crate::CTRL_C.reset();
     let mut progress = Progress::default();
-    let work = cortex_core::config::home().join("downloads");
+    let fallback = cortex_core::config::home().join("downloads");
+    let ollama_models = std::env::var("OLLAMA_MODELS").ok();
+    let mut work = cortex_core::import::download_dir(&cfg.base_url, ollama_models.as_deref(), cortex_core::config::user_home().as_deref(), &fallback);
+    // e.g. Linux's system Ollama keeps models in a folder only it can write to
+    if std::fs::create_dir_all(&work).is_err() { work = fallback; }
     let result = cortex_core::import::import_from_url(&be, url, id, &work, &crate::CTRL_C, &mut |p| progress.show(p));
+    let _ = std::fs::remove_dir(&work); // only if it's empty: never anything of Ollama's
     progress.end_line();
     result.map_err(|e| format!("couldn't import {id}: {e}"))?;
     println!("{}", ui::muted(&format!("{id} is ready")));

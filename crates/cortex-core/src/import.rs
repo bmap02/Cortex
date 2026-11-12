@@ -143,6 +143,21 @@ pub fn url_size(url: &str) -> Option<u64> {
     http().head(url).set("Accept-Encoding", "identity").call().ok()?.header("Content-Length")?.parse().ok()
 }
 
+/// Where a URL import downloads its file before handing it to Ollama: a `cortex-import` folder in
+/// Ollama's own models folder when Ollama runs on this machine, so the download needs room on the
+/// drive the models live on (`ollama_models` is OLLAMA_MODELS; the default is ~/.ollama/models).
+/// Otherwise, or when that folder isn't here, `fallback`.
+pub fn download_dir(base_url: &str, ollama_models: Option<&str>, user_home: Option<&Path>, fallback: &Path) -> PathBuf {
+    let after_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
+    let local = ["localhost:", "localhost/", "127.", "[::1]"].iter().any(|p| after_scheme.starts_with(p)) || after_scheme == "localhost";
+    let models = ollama_models.filter(|m| !m.trim().is_empty()).map(PathBuf::from)
+        .or_else(|| user_home.map(|h| h.join(".ollama").join("models")));
+    match models {
+        Some(dir) if local && dir.is_dir() => dir.join("cortex-import"),
+        _ => fallback.to_path_buf(),
+    }
+}
+
 /// Deletes the download when the import ends, however it ends: Ollama keeps its own copy.
 struct TempFile(PathBuf);
 impl Drop for TempFile {
