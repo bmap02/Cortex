@@ -344,7 +344,7 @@ crates/cortex-core/src/tools.rs     tool schemas and implementations
 crates/cortex-core/src/config.rs    settings and the Cortex home folder
 crates/cortex-core/src/cancel.rs    the per-session handle that stops a turn
 crates/cortex-core/src/calc.rs      calculator
-crates/cortex-core/src/hardware.rs  RAM, unified memory, OS and CPU of this machine
+crates/cortex-core/src/hardware.rs  RAM, GPUs and their VRAM, unified memory, OS and CPU of this machine
 crates/cortex-core/src/recommend.rs which catalog models suit the hardware (a pure function)
 crates/cortex-core/catalog.toml     the curated model catalog bundled into the binary
 crates/cortex-core/tests/session.rs drives agent turns against the fake model server

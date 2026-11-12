@@ -1,7 +1,7 @@
 //! Which models suit a machine: a pure function of its hardware profile and the model catalog.
 
 use crate::config::BackendKind;
-use crate::hardware::HardwareProfile;
+use crate::hardware::{GpuVendor, HardwareProfile};
 use serde::Deserialize;
 
 /// A model in the catalog. Sizes are in GB.
@@ -69,25 +69,60 @@ pub fn catalog() -> Vec<CatalogEntry> {
 const CPU_BANDWIDTH: f64 = 40.0;
 /// GB/s for Apple Silicon unified memory, roughly (the base chips; Pro/Max/Ultra are faster).
 const UNIFIED_BANDWIDTH: f64 = 100.0;
+/// GB/s for a dedicated GPU's memory, roughly (mid-range cards; the fastest reach 1000).
+const VRAM_BANDWIDTH: f64 = 300.0;
+
+/// What the GPU can hold of a model, and how fast it reads it.
+struct GpuShare { memory_gb: f64, bandwidth: f64 }
+
+fn gpu_share(hw: &HardwareProfile, ram_budget: f64, backend: BackendKind) -> GpuShare {
+    if hw.unified_memory {
+        // macOS lets the GPU use about 2/3 of unified memory (3/4 on machines with more than
+        // 36 GB), but never more than the system can spare
+        let share = if hw.total_ram_gb > 36.0 { 0.75 } else { 2.0 / 3.0 };
+        return GpuShare { memory_gb: (hw.total_ram_gb * share).min(ram_budget), bandwidth: UNIFIED_BANDWIDTH };
+    }
+    // Ollama runs models on NVIDIA (CUDA) and AMD (ROCm, not on macOS); llama.cpp-based servers
+    // can use any GPU through Vulkan
+    let usable_by_backend = |v: GpuVendor| backend != BackendKind::Ollama
+        || v == GpuVendor::Nvidia || (v == GpuVendor::Amd && hw.os != "macos");
+    // a model is split across GPUs of one vendor, not across vendors: take the vendor with the
+    // most memory. Keep 10% of each card (at least 0.5 GB) for the display and the runtime.
+    let mut by_vendor: Vec<(GpuVendor, f64)> = vec![];
+    for g in hw.gpus.iter().flatten().filter(|g| !g.integrated && g.vram_gb > 0.0 && usable_by_backend(g.vendor)) {
+        let usable = (g.vram_gb - (g.vram_gb / 10.0).max(0.5)).max(0.0);
+        match by_vendor.iter_mut().find(|(v, _)| *v == g.vendor) {
+            Some((_, total)) => *total += usable,
+            None => by_vendor.push((g.vendor, usable)),
+        }
+    }
+    GpuShare { memory_gb: by_vendor.into_iter().map(|(_, gb)| gb).fold(0.0, f64::max), bandwidth: VRAM_BANDWIDTH }
+}
 
 /// Rank the catalog's tool-capable models for this hardware.
 pub fn recommend(hw: &HardwareProfile, catalog: &[CatalogEntry], backend: BackendKind) -> Recommendations {
     // keep some RAM for the system and other programs
     let ram_budget = hw.total_ram_gb - (hw.total_ram_gb / 5.0).max(2.0);
-    // macOS lets the GPU use about 2/3 of unified memory (3/4 on machines with more than 36 GB),
-    // but never more than the system can spare
-    let gpu_memory = match hw.unified_memory {
-        true if hw.total_ram_gb > 36.0 => hw.total_ram_gb * 0.75,
-        true => hw.total_ram_gb * 2.0 / 3.0,
-        false => 0.0,
-    }.min(ram_budget);
+    let GpuShare { memory_gb: gpu_memory, bandwidth: gpu_bandwidth } = gpu_share(hw, ram_budget, backend);
     let mut models: Vec<Recommendation> = catalog.iter().filter(|m| m.tools).map(|m| {
+        // what doesn't fit on the GPU goes to RAM; unified memory is the same RAM, so it can't
+        // spill into more than the budget there
+        let spill = if hw.unified_memory { m.memory_gb } else { m.memory_gb - gpu_memory };
         let fit = if m.memory_gb <= gpu_memory { Fit::OnGpu }
-            else if m.memory_gb > ram_budget { Fit::DoesntFit }
+            else if spill > ram_budget { Fit::DoesntFit }
             else if gpu_memory > 0.0 { Fit::PartlyOnCpu }
             else { Fit::CpuOnly };
-        let bandwidth = if fit == Fit::OnGpu { UNIFIED_BANDWIDTH } else { CPU_BANDWIDTH };
-        let speed = (fit != Fit::DoesntFit).then(|| speed_tier(bandwidth / m.download_gb));
+        let speed = match fit {
+            Fit::OnGpu => Some(gpu_bandwidth / m.download_gb),
+            Fit::CpuOnly => Some(CPU_BANDWIDTH / m.download_gb),
+            // the GPU reads its share of the weights, the CPU the rest, one after the other
+            Fit::PartlyOnCpu if hw.unified_memory => Some(CPU_BANDWIDTH / m.download_gb),
+            Fit::PartlyOnCpu => {
+                let on_gpu = gpu_memory / m.memory_gb;
+                Some(1.0 / (m.download_gb * (on_gpu / gpu_bandwidth + (1.0 - on_gpu) / CPU_BANDWIDTH)))
+            }
+            Fit::DoesntFit => None,
+        }.map(speed_tier);
         Recommendation { model: m.clone(), fit, speed }
     }).collect();
     // usable and not slow (most capable first), then usable but slow (likewise), then too big

@@ -2,7 +2,7 @@
 //! recommendations with fit verdicts and speed tiers out.
 
 use cortex_core::config::BackendKind;
-use cortex_core::hardware::HardwareProfile;
+use cortex_core::hardware::{Gpu, GpuVendor, HardwareProfile};
 use cortex_core::recommend::{recommend, CatalogEntry, Fit, Speed};
 
 fn entry(id: &str, params_b: f64, download_gb: f64, memory_gb: f64, tools: bool) -> CatalogEntry {
@@ -22,7 +22,7 @@ fn catalog() -> Vec<CatalogEntry> {
 }
 
 fn ram_only(total_gb: f64) -> HardwareProfile {
-    HardwareProfile { total_ram_gb: total_gb, available_ram_gb: total_gb / 2.0, unified_memory: false, os: "linux".into(), arch: "x86_64".into() }
+    HardwareProfile { total_ram_gb: total_gb, available_ram_gb: total_gb / 2.0, unified_memory: false, gpus: Some(vec![]), os: "linux".into(), arch: "x86_64".into() }
 }
 
 /// (id, fit, speed) in ranked order.
@@ -44,7 +44,7 @@ fn cpu_only_8gb_gets_small_models_on_the_cpu() {
 
 #[test]
 fn apple_unified_16gb_runs_models_on_the_gpu() {
-    let hw = HardwareProfile { total_ram_gb: 16.0, available_ram_gb: 8.0, unified_memory: true, os: "macos".into(), arch: "aarch64".into() };
+    let hw = HardwareProfile { total_ram_gb: 16.0, available_ram_gb: 8.0, unified_memory: true, gpus: Some(vec![]), os: "macos".into(), arch: "aarch64".into() };
     // the GPU may use about 2/3 of unified memory (≈ 10.7 GB) at ~100 GB/s; 12.8 GB in all for a model
     assert_eq!(ranked(&hw), [
         ("mid".into(), Fit::OnGpu, Some(Speed::Moderate)),     // 100 / 4.7 ≈ 21 tok/s
@@ -90,8 +90,71 @@ fn the_bundled_catalog_is_usable() {
 #[test]
 fn a_small_mac_never_gets_more_on_the_gpu_than_it_can_spare() {
     // 4 GB unified: 2/3 would be 2.7 GB for the GPU, but only 2 GB is left after the system's share
-    let hw = HardwareProfile { total_ram_gb: 4.0, available_ram_gb: 2.0, unified_memory: true, os: "macos".into(), arch: "aarch64".into() };
+    let hw = HardwareProfile { total_ram_gb: 4.0, available_ram_gb: 2.0, unified_memory: true, gpus: Some(vec![]), os: "macos".into(), arch: "aarch64".into() };
     let between = entry("between", 2.0, 1.8, 2.5, true); // within the GPU's 2/3, over what the machine can spare
     let r = recommend(&hw, &[between], BackendKind::Ollama);
     assert_eq!(r.models[0].fit, Fit::DoesntFit);
+}
+
+fn gpu(vendor: GpuVendor, vram_gb: f64) -> Gpu {
+    Gpu { vendor, name: format!("{vendor:?} {vram_gb} GB"), vram_gb, integrated: false }
+}
+
+fn with_gpus(ram_gb: f64, gpus: Vec<Gpu>) -> HardwareProfile {
+    HardwareProfile { gpus: Some(gpus), ..ram_only(ram_gb) }
+}
+
+#[test]
+fn an_8gb_nvidia_card_runs_mid_models_and_offloads_bigger_ones() {
+    // 7.2 GB of the card for models (10% kept back); at ~300 GB/s VRAM vs ~40 GB/s RAM
+    assert_eq!(ranked(&with_gpus(16.0, vec![gpu(GpuVendor::Nvidia, 8.0)])), [
+        ("large".into(), Fit::PartlyOnCpu, Some(Speed::Moderate)), // 7.2 of 11 GB on the GPU ≈ 10 tok/s
+        ("mid".into(), Fit::OnGpu, Some(Speed::Fast)),            // 300 / 4.7 ≈ 64 tok/s
+        ("small".into(), Fit::OnGpu, Some(Speed::Fast)),
+        ("tiny".into(), Fit::OnGpu, Some(Speed::Fast)),
+        ("huge".into(), Fit::DoesntFit, None),                    // 14.8 GB left over; RAM can spare 12.8
+    ]);
+}
+
+#[test]
+fn a_24gb_card_offloads_only_a_little_of_a_32b_model() {
+    assert_eq!(ranked(&with_gpus(32.0, vec![gpu(GpuVendor::Nvidia, 24.0)])), [
+        ("huge".into(), Fit::PartlyOnCpu, Some(Speed::Moderate)), // 21.6 of 22 GB on the GPU ≈ 13 tok/s
+        ("large".into(), Fit::OnGpu, Some(Speed::Fast)),          // 300 / 9 ≈ 33 tok/s
+        ("mid".into(), Fit::OnGpu, Some(Speed::Fast)),
+        ("small".into(), Fit::OnGpu, Some(Speed::Fast)),
+        ("tiny".into(), Fit::OnGpu, Some(Speed::Fast)),
+    ]);
+}
+
+#[test]
+fn an_integrated_gpu_counts_as_cpu_only() {
+    let igpu = Gpu { vendor: GpuVendor::Intel, name: "Intel UHD Graphics".into(), vram_gb: 0.1, integrated: true };
+    assert_eq!(ranked(&with_gpus(16.0, vec![igpu])), ranked(&ram_only(16.0)));
+}
+
+#[test]
+fn gpus_of_one_vendor_share_a_model_and_other_vendors_do_not_add() {
+    let two_12gb_and_an_amd = vec![gpu(GpuVendor::Nvidia, 12.0), gpu(GpuVendor::Nvidia, 12.0), gpu(GpuVendor::Amd, 8.0)];
+    assert_eq!(ranked(&with_gpus(32.0, two_12gb_and_an_amd)), ranked(&with_gpus(32.0, vec![gpu(GpuVendor::Nvidia, 24.0)])));
+    // the bigger vendor group wins even when it isn't listed first
+    let amd_first = vec![gpu(GpuVendor::Amd, 8.0), gpu(GpuVendor::Nvidia, 24.0)];
+    assert_eq!(ranked(&with_gpus(32.0, amd_first)), ranked(&with_gpus(32.0, vec![gpu(GpuVendor::Nvidia, 24.0)])));
+}
+
+#[test]
+fn when_gpu_detection_fails_recommendations_use_ram_only() {
+    let unknown = HardwareProfile { gpus: None, ..ram_only(16.0) };
+    assert_eq!(ranked(&unknown), ranked(&ram_only(16.0)));
+}
+
+#[test]
+fn ollama_only_counts_gpus_it_can_run_models_on() {
+    // Ollama runs on NVIDIA and AMD; llama.cpp-based servers (Vulkan) use Intel Arc too
+    let arc = with_gpus(16.0, vec![gpu(GpuVendor::Intel, 16.0)]);
+    let on_ollama = recommend(&arc, &catalog(), BackendKind::Ollama).models;
+    assert!(on_ollama.iter().all(|r| r.fit != Fit::OnGpu), "Ollama can't use the Arc card");
+    assert_eq!(on_ollama, recommend(&ram_only(16.0), &catalog(), BackendKind::Ollama).models);
+    let elsewhere = recommend(&arc, &catalog(), BackendKind::Openai).models;
+    assert_eq!(elsewhere[0].fit, Fit::OnGpu);
 }

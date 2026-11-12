@@ -272,7 +272,7 @@ fn gauges() -> Vec<ui::Gauge> {
         && let Some(line) = String::from_utf8_lossy(&o.stdout).lines().next() {
             let p: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
             if let (Some(name), Some(Ok(u)), Some(Ok(t))) = (p.first(), p.get(1).map(|s| s.parse::<f64>()), p.get(2).map(|s| s.parse::<f64>())) {
-                g.push(ui::Gauge { label: "gpu".into(), frac: u / t, detail: format!("{:.1}/{:.1} GB  {name}", u / 1024.0, t / 1024.0) });
+                g.push(ui::Gauge { label: "gpu".into(), frac: u / t, detail: format!("{:.1}/{:.1} GB  {name}", u * 1.048576 / 1e3, t * 1.048576 / 1e3) }); // MiB, shown in GB like the rest
             }
         }
     let Ok(mut sys) = sysinfo::System::new() else { return g };
@@ -562,9 +562,9 @@ fn print_recommendations(cfg: &Config) {
         return;
     }
     let recs = recommend::recommend(&hw, &recommend::catalog(), cfg.backend);
-    let memory = if hw.unified_memory { "unified memory, shared with the GPU" } else { "RAM" };
-    println!("{}", ui::bold(&format!("This machine: {:.0} GB {memory} ({:.1} GB free) · {} {}", hw.total_ram_gb, hw.available_ram_gb, hw.os, hw.arch)));
-    if !hw.unified_memory { println!("{}", ui::faint("  GPUs aren't detected yet, so these assume the model runs on the CPU.")); }
+    let (summary, details) = describe_hardware(&hw);
+    println!("{}", ui::bold(&format!("This machine: {summary}")));
+    for d in details { println!("{}", ui::faint(&format!("  {d}"))); }
     println!();
     let (fits, too_big): (Vec<_>, Vec<_>) = recs.models.iter().partition(|r| r.fit != Fit::DoesntFit);
     if fits.is_empty() { println!("{}", ui::error("None of the models Cortex knows fit in this machine's memory.")); }
@@ -590,6 +590,23 @@ fn print_recommendations(cfg: &Config) {
         println!("{}", ui::faint("  Recommendations only: Cortex installs models through Ollama, and you're using an OpenAI-compatible server."));
         println!("{}", ui::faint("  Load one of these in your server, then pick it with `cortex model <name>`."));
     }
+}
+
+/// A one-line summary of the hardware, and a line per GPU (or why there are none).
+fn describe_hardware(hw: &cortex_core::hardware::HardwareProfile) -> (String, Vec<String>) {
+    let memory = if hw.unified_memory { "unified memory, shared with the GPU" } else { "RAM" };
+    let summary = format!("{:.0} GB {memory} ({:.1} GB free) · {} {}", hw.total_ram_gb, hw.available_ram_gb, hw.os, hw.arch);
+    let details = match &hw.gpus {
+        _ if hw.unified_memory => vec![],
+        None => vec!["Couldn't detect GPUs: models are rated for the CPU only.".to_string()],
+        Some(gpus) if gpus.is_empty() => vec!["No GPU found: models are rated for the CPU.".to_string()],
+        Some(gpus) => gpus.iter().map(|g| match (g.integrated, g.vram_gb > 0.0) {
+            (true, _) => format!("GPU: {} (built in, shares RAM: not used for models)", g.name),
+            (false, true) => format!("GPU: {}, {:.1} GB", g.name, g.vram_gb),
+            (false, false) => format!("GPU: {} (couldn't read its memory: not used for models)", g.name),
+        }).collect(),
+    };
+    (summary, details)
 }
 
 fn pick_model(cfg: &Config, name: Option<String>) -> i32 {
@@ -840,6 +857,9 @@ fn doctor(cfg: &Config) -> i32 {
     let bad = |s: &str| println!("  {} {s}", ui::error("✗"));
     println!("{}", ui::bold("cortex doctor"));
     if Config::exists() { ok(&format!("config at {}", config::config_path().display())) } else { bad("no config yet: run `cortex setup`") }
+    let (summary, details) = describe_hardware(&cortex_core::hardware::probe());
+    ok(&format!("hardware: {summary}"));
+    for d in details { println!("    {}", ui::faint(&d)); }
     ok(&format!("backend: {} at {}", cfg.backend.label(), cfg.base_url));
     let be = Backend::new(cfg);
     let models = match be.list_models() {
