@@ -215,6 +215,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sysinfo",
  "toml",
  "ureq",
 ]

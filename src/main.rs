@@ -101,6 +101,8 @@ enum ModelsCmd {
     List,
     /// Download a model (Ollama only)
     Pull { name: String },
+    /// Models that suit this machine, best first (works offline)
+    Recommend,
 }
 
 fn main() {
@@ -117,6 +119,7 @@ fn main() {
         Cmd::Model { name } => pick_model(&cfg, name),
         Cmd::Models { action } => match action.unwrap_or(ModelsCmd::List) {
             ModelsCmd::List => print_models(&cfg),
+            ModelsCmd::Recommend => { print_recommendations(&cfg); 0 }
             ModelsCmd::Pull { name } => match Backend::new(&cfg).pull(&name) {
                 Ok(()) => { println!("pulled {name}"); 0 }
                 Err(e) => { eprintln!("{}", ui::error(&e.to_string())); 1 }
@@ -548,6 +551,44 @@ fn print_models(cfg: &Config) -> i32 {
             0
         }
         Err(e) => { eprintln!("{}", ui::error(&e.to_string())); 1 }
+    }
+}
+
+fn print_recommendations(cfg: &Config) {
+    use cortex_core::recommend::{self, Fit, Speed};
+    let hw = cortex_core::hardware::probe();
+    if hw.total_ram_gb <= 0.0 {
+        println!("{}", ui::error("Couldn't read how much memory this machine has, so there's nothing to recommend from."));
+        return;
+    }
+    let recs = recommend::recommend(&hw, &recommend::catalog(), cfg.backend);
+    let memory = if hw.unified_memory { "unified memory, shared with the GPU" } else { "RAM" };
+    println!("{}", ui::bold(&format!("This machine: {:.0} GB {memory} ({:.1} GB free) · {} {}", hw.total_ram_gb, hw.available_ram_gb, hw.os, hw.arch)));
+    if !hw.unified_memory { println!("{}", ui::faint("  GPUs aren't detected yet, so these assume the model runs on the CPU.")); }
+    println!();
+    let (fits, too_big): (Vec<_>, Vec<_>) = recs.models.iter().partition(|r| r.fit != Fit::DoesntFit);
+    if fits.is_empty() { println!("{}", ui::error("None of the models Cortex knows fit in this machine's memory.")); }
+    for (i, r) in fits.iter().enumerate() {
+        let m = &r.model;
+        // other servers name models differently: show what to look for there
+        let shown = r.display_name(recs.can_install);
+        let fit = match r.fit { Fit::OnGpu => "fits on GPU", Fit::PartlyOnCpu => "partly on CPU", Fit::CpuOnly | Fit::DoesntFit => "CPU only" };
+        let speed = match r.speed { Some(Speed::Fast) => "fast", Some(Speed::Moderate) => "moderate", Some(Speed::Slow) | None => "slow" };
+        let params = if m.params_b < 10.0 { format!("{:.1}B", m.params_b) } else { format!("{:.0}B", m.params_b) };
+        // pad before styling: escape codes would count toward the width
+        let mark = if m.id == cfg.model || m.name == cfg.model { ui::bold(&format!("{:>3}", ui::DOT)) } else { ui::faint(&format!("{:>2}.", i + 1)) };
+        println!("  {mark} {shown:<30} {}  {}  {fit:<14} {}", ui::faint(&format!("{params:>5}")), ui::faint(&format!("{:>4.1} GB", m.download_gb)), ui::muted(speed));
+    }
+    if !too_big.is_empty() {
+        let names: Vec<&str> = too_big.iter().map(|r| r.display_name(recs.can_install)).collect();
+        println!("  {}", ui::faint(&format!("too big for this machine: {}", names.join(", "))));
+    }
+    println!();
+    if recs.can_install {
+        println!("{}", ui::faint("  Download one with `cortex models pull <name>`, then `cortex model <name>`."));
+    } else {
+        println!("{}", ui::faint("  Recommendations only: Cortex installs models through Ollama, and you're using an OpenAI-compatible server."));
+        println!("{}", ui::faint("  Load one of these in your server, then pick it with `cortex model <name>`."));
     }
 }
 

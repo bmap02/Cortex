@@ -258,6 +258,7 @@ cat error.log | cortex run -q "what went wrong?"
 cortex run --no-tools "explain ownership in Rust"   # plain answer, no tool use
 cortex models                   # list models on the server
 cortex models pull qwen2.5:7b   # download (Ollama)
+cortex models recommend         # models that suit this machine, best first (offline)
 cortex model qwen2.5:7b         # set the default model
 cortex tools                    # list tools; cortex tools disable run_shell
 cortex tools enable fetch_url   # let the agent read web pages (turns on network access)
@@ -343,6 +344,9 @@ crates/cortex-core/src/tools.rs     tool schemas and implementations
 crates/cortex-core/src/config.rs    settings and the Cortex home folder
 crates/cortex-core/src/cancel.rs    the per-session handle that stops a turn
 crates/cortex-core/src/calc.rs      calculator
+crates/cortex-core/src/hardware.rs  RAM, unified memory, OS and CPU of this machine
+crates/cortex-core/src/recommend.rs which catalog models suit the hardware (a pure function)
+crates/cortex-core/catalog.toml     the curated model catalog bundled into the binary
 crates/cortex-core/tests/session.rs drives agent turns against the fake model server
 tests/mock_server.py   fake Ollama/OpenAI server for testing without a model
 install.sh / install.ps1   one-line installers (download a release)

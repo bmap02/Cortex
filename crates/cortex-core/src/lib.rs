@@ -7,4 +7,6 @@ pub mod backend;
 pub mod calc;
 pub mod cancel;
 pub mod config;
+pub mod hardware;
+pub mod recommend;
 pub mod tools;
