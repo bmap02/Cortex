@@ -128,6 +128,8 @@ pub struct ToolContext<'a> {
     pub session_id: &'a str,
     /// Where `remember` saves and `recall` searches.
     pub memory: &'a crate::memory::Memory,
+    /// Collects the ids of the notes `recall` returns and `remember` saves, for the session's note.
+    pub used: &'a std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 /// Run a tool.
@@ -398,6 +400,7 @@ fn recall(a: &Value, ctx: &ToolContext) -> Result<String, String> {
     // deeper than the automatic recall (more matches), and at most a quarter of the context
     let notes = ctx.memory.recall(query, 20, ctx.cfg.num_ctx / 4);
     if notes.is_empty() { return Ok(format!("nothing in memory matches '{query}'")); }
+    ctx.used.borrow_mut().extend(notes.iter().map(|n| n.id.clone()));
     Ok(notes.iter().map(|n| crate::memory::render_with_links(n, &ctx.memory.links(n))).collect::<Vec<_>>().join("\n"))
 }
 
@@ -408,10 +411,12 @@ fn remember(a: &Value, ctx: &ToolContext) -> Result<String, String> {
     let fact = crate::memory::one_line(arg(a, "fact")?);
     let kind = a["kind"].as_str().filter(|k| ["preference", "project"].contains(k)).unwrap_or("fact");
     let source = (!session_id.is_empty()).then(|| session_id.to_string());
-    match ctx.memory.add(NewNote { title: short_title(&fact), body: fact, kind: kind.into(), source })? {
-        Added::Created(n) => Ok(format!("saved to memory as [[{}]]", n.id)),
-        Added::Exists(n) => Ok(format!("already remembered in [[{}]]", n.id)),
-    }
+    let (verb, n) = match ctx.memory.add(NewNote { title: short_title(&fact), body: fact, kind: kind.into(), source })? {
+        Added::Created(n) => ("saved to memory as", n),
+        Added::Exists(n) => ("already remembered in", n),
+    };
+    ctx.used.borrow_mut().insert(n.id.clone());
+    Ok(format!("{verb} [[{}]]", n.id))
 }
 
 #[cfg(test)]

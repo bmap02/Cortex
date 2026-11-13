@@ -5,6 +5,7 @@ Scripted behaviour: if the last message is from the user, ask for a tool call
 tool result comes back, stream a final answer that quotes the result. A prompt
 containing "loop" repeats the same calculator call until Cortex refuses to rerun it.
 "write to <path>" asks to write that file; "slow" streams a long answer slowly (for stopping).
+Asked to summarize the conversation (a request without tools), it lists the user's messages.
 /api/pull streams download progress and adds the model to /api/tags.
 For imports: /api/models/<repo>/tree/main lists a Hugging Face repo's files, /files/model.gguf is a
 GGUF to download (slowly, so it can be stopped), and /api/blobs + /api/create take an upload.
@@ -40,6 +41,14 @@ def decide(messages):
     if any(c.isdigit() for c in text):
         return ("tool", "calculator", {"expression": "1234 * 5678"})
     return ("text", "Hi! I'm a mock model running locally.")
+
+def plain(messages):
+    """A reply without tools. Asked for a summary, it lists the user's messages (slowly if one says "lengthy")."""
+    if not messages[-1]["content"].startswith("Summarize our conversation"):
+        return ("text", "Plain chat answer without tools.")
+    asked = [m["content"][:60] for m in messages[:-1] if m["role"] == "user"]
+    words = " ".join(f"word{i}" for i in range(200)) + " " if any("lengthy" in a for a in asked) else ""
+    return ("text", words + "Summary: the user asked " + " | ".join(asked))
 
 LAST_CHAT = {}  # the last chat request, for tests to see exactly what the model was sent
 PULLED = []  # models "downloaded" through /api/pull or created through /api/create
@@ -129,7 +138,7 @@ class H(BaseHTTPRequestHandler):
             return self._json({"model_info": {"general.architecture": "qwen2", "qwen2.context_length": 32768}})
         if body.get("model") == "notools" and body.get("tools"):
             return self._json({"error": "registry.ollama.ai/library/notools does not support tools"}, 400)
-        d = decide(body["messages"]) if body.get("tools") else ("text", "Plain chat answer without tools.")
+        d = decide(body["messages"]) if body.get("tools") else plain(body["messages"])
         if self.path == "/api/chat":
             self.send_response(200); self.send_header("Content-Type", "application/x-ndjson"); self.end_headers()
             if d[0] == "tool":

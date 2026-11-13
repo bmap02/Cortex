@@ -155,6 +155,7 @@ fn the_turn_stops_at_the_step_limit() {
 fn a_nearly_full_context_is_compressed_before_the_next_reply() {
     let server = MockServer::start();
     let mut agent = agent(&server);
+    agent.memory = cortex_core::memory::Memory::open(&scratch_dir("compress_auto")); // it writes a session note
     agent.cfg.num_ctx = 512;
     for i in 0..3 { // earlier conversation, far more than 512 tokens
         agent.msgs.push(cortex_core::backend::Msg::new("user", format!("question {i} {}", "padding ".repeat(200))));
@@ -286,4 +287,147 @@ fn a_follow_up_question_still_brings_back_what_it_follows_up() {
     agent.send("and how old is she?", |_| {}).unwrap();
     let sent = sent_user_message(&server);
     assert!(sent.contains("Biscuit") && sent.contains("Dr Lee"), "{sent}");
+}
+
+// ---------------------------------------------------------------- session notes
+
+fn session_notes(agent: &Agent) -> Vec<cortex_core::memory::Note> {
+    agent.memory.notes().into_iter().filter(|n| n.kind == "session").collect()
+}
+
+#[test]
+fn ending_a_session_writes_a_session_note_that_later_sessions_find() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "end");
+    agent.send("what is my cat called?", |_| {}).unwrap();
+    agent.send("and how old is she?", |_| {}).unwrap();
+    assert!(agent.wants_session_note());
+    let note = agent.end_session().unwrap().expect("a session note");
+
+    assert_eq!(note.id, format!("session-{}", agent.session_id));
+    assert_eq!((note.kind.as_str(), note.source.as_deref()), ("session", Some(agent.session_id.as_str())));
+    assert!(note.title.starts_with("Session: ") && note.title.contains("cat"), "{}", note.title);
+    assert!(note.body.contains("Summary: the user asked what is my cat called? | and how old is she?"), "the model's summary: {}", note.body);
+    assert!(note.body.contains("[[cat]]") && note.body.contains("[[vet]]"), "links to the notes it recalled: {}", note.body);
+    assert!(!note.body.contains("[[coffee]]"), "not to notes it didn't use: {}", note.body);
+    assert_eq!(agent.memory.links(&note).outgoing.len(), 2);
+
+    // found by search, by the recall tool and by automatic recall
+    assert!(agent.memory.search("how old", 5).iter().any(|h| h.note.id == note.id));
+    let mut later = self::agent(&server);
+    later.memory = cortex_core::memory::Memory::open(agent.memory.dir().parent().unwrap());
+    later.cfg.memory_budget = 0.0;
+    let (_, trace) = run_turn(&mut later, "recall how old", Approval::Deny);
+    assert!(trace[1].contains(&format!("[[{}]]", note.id)), "{}", trace[1]);
+    later.cfg.memory_budget = 0.5;
+    later.send("how old is she again?", |_| {}).unwrap();
+    assert!(sent_user_message(&server).contains(&format!("[[{}]]", note.id)), "{}", sent_user_message(&server));
+}
+
+#[test]
+fn ending_again_after_more_messages_updates_the_same_note() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "update");
+    agent.send("what is my cat called?", |_| {}).unwrap();
+    agent.send("hello", |_| {}).unwrap();
+    let first = agent.end_session().unwrap().expect("a session note");
+    assert!(!agent.wants_session_note() && agent.end_session().unwrap().is_none(), "nothing new to note");
+
+    agent.send("tell me about coffee", |_| {}).unwrap();
+    let second = agent.end_session().unwrap().expect("an updated note");
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.title, first.title);
+    assert!(second.body.contains("coffee") && second.body.contains("[[coffee]]"), "{}", second.body);
+    assert_eq!(session_notes(&agent).len(), 1);
+}
+
+#[test]
+fn a_short_session_writes_no_note() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "short");
+    assert!(agent.end_session().unwrap().is_none(), "an empty session");
+    agent.send("what is my cat called?", |_| {}).unwrap();
+    assert!(!agent.wants_session_note());
+    assert!(agent.end_session().unwrap().is_none(), "a single question");
+    assert!(session_notes(&agent).is_empty());
+}
+
+#[test]
+fn compressing_writes_a_session_note_and_the_session_does_not_recall_its_own() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "compress");
+    agent.cfg.num_ctx = 512;
+    for i in 0..3 {
+        agent.msgs.push(cortex_core::backend::Msg::new("user", format!("question {i} {}", "padding ".repeat(200))));
+        agent.msgs.push(cortex_core::backend::Msg::new("assistant", "an answer"));
+    }
+    agent.send("hello", |_| {}).unwrap(); // compressed automatically first
+    let notes = session_notes(&agent);
+    assert_eq!(notes.len(), 1, "automatic compression wrote a note");
+    assert!(notes[0].body.contains("question 0"), "{}", notes[0].body);
+
+    agent.send("what is my cat called?", |_| {}).unwrap();
+    agent.compress().unwrap(); // and /compress
+    let notes = session_notes(&agent);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].body.contains("[[cat]]"), "{}", notes[0].body);
+
+    agent.cfg.memory_budget = 0.5; // room for the session note, were it recalled
+    agent.send("question padding answer", |_| {}).unwrap();
+    assert!(!sent_user_message(&server).contains("[[session-"), "its own summary is already in the conversation");
+}
+
+#[test]
+fn notes_the_session_remembered_or_looked_up_are_linked_from_its_note() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "tools_link");
+    agent.cfg.memory_budget = 0.0; // only the tools bring notes in
+    run_turn(&mut agent, "please remember that the dog is called Rex", Approval::AllowOnce).0.unwrap();
+    run_turn(&mut agent, "recall coffee", Approval::Deny).0.unwrap();
+    let dog = agent.memory.notes().into_iter().find(|n| n.body.contains("Rex")).unwrap();
+    let note = agent.end_session().unwrap().expect("a session note");
+    assert!(note.body.contains(&format!("[[{}]]", dog.id)), "what it remembered: {}", note.body);
+    assert!(note.body.contains("[[coffee]]"), "what it recalled: {}", note.body);
+    assert!(!note.body.contains("[[cat]]"), "{}", note.body);
+}
+
+#[test]
+fn a_stopped_summary_writes_no_note() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "stopped");
+    agent.send("hello", |_| {}).unwrap();
+    agent.send("a lengthy chat", |_| {}).unwrap();
+    let cancel = agent.cancel.clone();
+    let stopper = std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_millis(300)); cancel.cancel(); });
+    assert!(agent.end_session().is_err());
+    stopper.join().unwrap();
+    assert!(session_notes(&agent).is_empty());
+    assert!(agent.wants_session_note(), "still to be written");
+}
+
+#[test]
+fn a_resumed_session_keeps_the_links_it_had() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "resume");
+    agent.send("what is my cat called?", |_| {}).unwrap();
+    agent.send("hello", |_| {}).unwrap();
+    agent.end_session().unwrap().expect("a session note");
+
+    let mut later = self::agent(&server);
+    later.memory = cortex_core::memory::Memory::open(agent.memory.dir().parent().unwrap());
+    later.resume(cortex_core::agent::load_session(&agent.session_id).unwrap());
+    later.cfg.memory_budget = 0.0; // so the cat note can only come from before the resume
+    run_turn(&mut later, "recall coffee", Approval::Deny).0.unwrap();
+    let note = later.end_session().unwrap().expect("the note, updated");
+    assert!(note.body.contains("[[cat]]") && note.body.contains("[[coffee]]"), "{}", note.body);
+    assert_eq!(session_notes(&later).len(), 1);
+}
+
+#[test]
+fn compressing_a_single_exchange_writes_no_note() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "compress_short");
+    agent.send("hello", |_| {}).unwrap();
+    agent.compress().unwrap();
+    assert!(session_notes(&agent).is_empty());
 }

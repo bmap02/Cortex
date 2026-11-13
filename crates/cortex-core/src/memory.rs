@@ -109,13 +109,25 @@ impl Memory {
             }
         }).expect("some id is free")?;
         let now = crate::agent::utc_iso(crate::agent::now());
-        let title = one_line(&new.title);
-        let mut text = format!("---\nid: {id}\ntitle: {title}\nkind: {}\ncreated: {now}\nupdated: {now}\n", one_line(&new.kind));
-        if let Some(s) = &new.source { text += &format!("source: {}\n", one_line(s)); }
-        text += &format!("---\n\n{body}\n");
-        std::io::Write::write_all(&mut file, text.as_bytes()).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
+        std::io::Write::write_all(&mut file, note_text(&id, &new, &now, &now).as_bytes()).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
         drop(file);
         read_note(&path).map(Added::Created).ok_or_else(|| format!("couldn't read back {}", path.display()))
+    }
+
+    /// Write the note with this id, replacing it if it's there (it keeps its created date). For
+    /// notes Cortex rewrites, like a session's summary. `id` must be a file-name-safe slug.
+    pub fn put(&self, id: &str, new: NewNote) -> Result<Note, String> {
+        if new.body.trim().is_empty() { return Err("a note needs some text".into()); }
+        std::fs::create_dir_all(&self.dir).map_err(|e| format!("couldn't create {}: {e}", self.dir.display()))?;
+        let path = self.dir.join(format!("{id}.md"));
+        let now = crate::agent::utc_iso(crate::agent::now());
+        let created = read_note(&path).map(|n| n.created).filter(|c| !c.is_empty()).unwrap_or_else(|| now.clone());
+        // write it whole, then swap it in: a crash never leaves half a note
+        let tmp = self.dir.join(format!(".{id}.{}.md.tmp", std::process::id())); // two windows never share one
+        std::fs::write(&tmp, note_text(id, &new, &created, &now))
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("couldn't write {}: {e}", path.display()) })?;
+        read_note(&path).ok_or_else(|| format!("couldn't read back {}", path.display()))
     }
 
     /// Delete one note (by id or title). Links to it stay in other notes' text, now pointing
@@ -289,6 +301,13 @@ struct Doc {
 
 fn modified_ns(m: &std::fs::Metadata) -> u64 {
     m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64).unwrap_or(0)
+}
+
+/// A note file: frontmatter, then the text.
+fn note_text(id: &str, new: &NewNote, created: &str, updated: &str) -> String {
+    let mut text = format!("---\nid: {id}\ntitle: {}\nkind: {}\ncreated: {created}\nupdated: {updated}\n", one_line(&new.title), one_line(&new.kind));
+    if let Some(s) = &new.source { text += &format!("source: {}\n", one_line(s)); }
+    text + &format!("---\n\n{}\n", new.body.trim())
 }
 
 /// Read a note file: frontmatter (`key: value` lines between `---`) and the body after it.

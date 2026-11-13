@@ -247,3 +247,24 @@ fn recall_never_goes_over_its_budget() {
     assert_eq!(mem.recall("cat biscuit", 8, full).len(), all.len());
     assert!(mem.recall("cat biscuit", 8, 0).is_empty());
 }
+
+#[test]
+fn put_writes_a_note_at_its_id_and_rewrites_it_keeping_when_it_was_created() {
+    let h = home("put");
+    let mem = Memory::open(&h);
+    let session = |body: &str| NewNote { title: "Session: cats".into(), body: body.into(), kind: "session".into(), source: Some("20261113-090000".into()) };
+    let first = mem.put("session-20261113-090000", session("First summary.")).unwrap();
+    assert_eq!((first.id.as_str(), first.kind.as_str(), first.body.as_str()), ("session-20261113-090000", "session", "First summary."));
+    // pretend it was written long ago
+    let text = std::fs::read_to_string(&first.path).unwrap().replace(&first.created, "2020-01-01T00:00:00Z");
+    std::fs::write(&first.path, text).unwrap();
+
+    let second = mem.put("session-20261113-090000", session("Second summary.")).unwrap();
+    assert_eq!(second.body, "Second summary.");
+    assert_eq!(second.created, "2020-01-01T00:00:00Z", "still created when it was first written");
+    assert!(second.updated > second.created);
+    assert_eq!(mem.notes().len(), 1, "rewritten, not added again");
+    let files: Vec<String> = std::fs::read_dir(mem.dir()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(files.iter().all(|f| f == "session-20261113-090000.md" || f == ".index.json"), "no temporary files left: {files:?}");
+    assert!(mem.put("session-x", session("  ")).is_err(), "a note needs some text");
+}

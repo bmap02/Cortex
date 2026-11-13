@@ -12,6 +12,8 @@ use crate::config::{self, Config};
 use crate::memory::{self, Memory};
 use crate::tools;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
@@ -133,6 +135,10 @@ pub struct Agent {
     pub memory: Memory,
     /// The memories recalled for the turn in progress, as sent ahead of its message.
     turn_memory_block: Option<String>,
+    /// Ids of the memory notes this session recalled or saved: its session note links to them.
+    used: RefCell<BTreeSet<String>>,
+    /// The conversation has moved on since its session note was last written.
+    note_due: bool,
 }
 
 /// What happens during a turn, in order. The last event is always [`Event::Done`] or [`Event::Error`].
@@ -262,6 +268,8 @@ impl Agent {
             cancel: CancelHandle::new(),
             memory,
             turn_memory_block: None,
+            used: RefCell::default(),
+            note_due: false,
             backend,
             cfg,
         }
@@ -272,6 +280,8 @@ impl Agent {
         self.session_id = fresh_session_id();
         self.created = now();
         self.last = Usage::default();
+        self.used.take();
+        self.note_due = false;
     }
 
     pub fn resume(&mut self, s: Session) {
@@ -279,6 +289,10 @@ impl Agent {
         self.msgs.extend(s.messages);
         self.session_id = s.id;
         self.created = s.created;
+        // its note is rewritten whole when it ends: keep the links it has from before
+        let linked = self.memory.find(&self.note_id()).map(|n| self.memory.links(&n).outgoing.into_iter().map(|l| l.target).collect());
+        self.used.replace(linked.unwrap_or_default());
+        self.note_due = false;
     }
 
     pub fn save(&self) {
@@ -296,7 +310,11 @@ impl Agent {
         if budget == 0 { return vec![]; }
         let mut query: Vec<&str> = self.msgs.iter().rev().filter(|m| m.role == "user").take(2).map(|m| m.content.as_str()).collect();
         query.push(text);
-        self.memory.recall(&query.join("\n"), 8, budget)
+        // not this session's own note: its summary is in the conversation already
+        let own = self.note_id();
+        let mut notes = self.memory.recall(&query.join("\n"), 8, budget);
+        notes.retain(|n| n.id != own);
+        notes
     }
 
     /// The conversation as sent to the model: the recalled memories go ahead of the latest user
@@ -349,6 +367,7 @@ impl Agent {
         }
         self.cancel.reset(); // a stop meant for an earlier turn doesn't carry over
         let notes = self.recall_for(text);
+        self.used.borrow_mut().extend(notes.iter().map(|n| n.id.clone()));
         self.turn_memory_block = (!notes.is_empty()).then(|| memory_block(&notes));
         if !notes.is_empty() { on_event(Event::Recalled { notes: notes.into_iter().map(|n| n.title).collect() }); }
         self.msgs.push(Msg::new("user", text));
@@ -449,7 +468,7 @@ impl Agent {
                         declined = true;
                         "The user declined this action. Do not retry it or try a workaround; wait for their instructions.".to_string()
                     }
-                    Some(_) => tools::execute(&call.name, &call.args, &tools::ToolContext { cfg: &self.cfg, cancel: &self.cancel, session_id: &self.session_id, memory: &self.memory }),
+                    Some(_) => tools::execute(&call.name, &call.args, &tools::ToolContext { cfg: &self.cfg, cancel: &self.cancel, session_id: &self.session_id, memory: &self.memory, used: &self.used }),
                 };
                 emit(Event::ToolFinished { result: result.clone() });
                 self.msgs.push(Msg::tool_result(call, result));
@@ -471,6 +490,7 @@ impl Agent {
             }
         }
         self.save();
+        self.note_due = true;
         let stats = TurnStats { ctx_used: self.ctx_used(), ctx_max: self.cfg.num_ctx, tok_per_s: self.last.tok_per_s, tool_calls: tool_calls_made };
         Ok((final_text, stats))
     }
@@ -480,21 +500,67 @@ impl Agent {
     pub fn compress(&mut self) -> Result<(), String> {
         if self.msgs.len() <= 2 { return Ok(()); }
         let split = compress_split(&self.msgs);
-        let mut req = self.msgs[..split].to_vec();
-        req.push(Msg::new("user", "Summarize our conversation so far for your own future reference: the user's goals, key facts, decisions, files touched and anything still open. Be dense; bullet points."));
-        let r = self.backend.chat(&self.cfg, &self.model, &req, &[], &self.cancel, &mut |_| {}).map_err(|e| e.to_string())?;
-        // a summary cut short would replace the conversation with part of one
-        if r.interrupted { return Err("stopped while compressing the conversation; nothing was changed".into()); }
+        let summary = self.summarize(&self.msgs[..split])?.ok_or("stopped while compressing the conversation; nothing was changed")?;
+        // a note that can't be written now is written again when the session ends
+        if self.user_turns() >= 2 { let _ = self.write_session_note(&summary); }
         let mut tail = self.msgs.split_off(split);
         // Everything was summarized but a request is still being worked on (the last message is the
         // user's or a tool result): repeat the request so the model still has something to answer.
         if tail.is_empty() && self.msgs.last().is_some_and(|m| m.role != "assistant")
             && let Some(u) = self.msgs.iter().rfind(|m| m.role == "user") { tail.push(u.clone()); }
         let sys = self.msgs[0].clone();
-        self.msgs = vec![sys, Msg::new("user", format!("[Summary of the earlier conversation]\n{}", r.content)), Msg::new("assistant", "Understood, I have the context.")];
+        self.msgs = vec![sys, Msg::new("user", format!("{SUMMARY_MARK}\n{summary}")), Msg::new("assistant", "Understood, I have the context.")];
         self.msgs.extend(tail);
         self.last = Usage::default();
         Ok(())
+    }
+
+    /// A model-written summary of `msgs`, or None if it was stopped (a summary cut short would
+    /// stand in for the whole conversation).
+    fn summarize(&self, msgs: &[Msg]) -> Result<Option<String>, String> {
+        let mut req = msgs.to_vec();
+        // tests/mock_server.py recognizes this prompt: keep the two in step
+        req.push(Msg::new("user", "Summarize our conversation so far for your own future reference: the user's goals, key facts, decisions, files touched and anything still open. Be dense; bullet points."));
+        let r = self.backend.chat(&self.cfg, &self.model, &req, &[], &self.cancel, &mut |_| {}).map_err(|e| e.to_string())?;
+        Ok((!r.interrupted).then_some(r.content))
+    }
+
+    /// The id of this session's note in long-term memory.
+    fn note_id(&self) -> String { format!("session-{}", self.session_id) }
+
+    /// Whether ending the session now would write its session note: there's more than a single
+    /// question in it, and something new since the note was last written.
+    pub fn wants_session_note(&self) -> bool {
+        self.note_due && !self.model.is_empty() && self.user_turns() >= 2
+    }
+
+    fn user_turns(&self) -> usize { self.msgs.iter().filter(|m| m.role == "user").count() }
+
+    /// Save the session's summary as its note in long-term memory, linked to the notes it used.
+    /// Writes nothing (None) for a session too short to need one. Call it when the session ends;
+    /// it asks the model for the summary, and the cancel handle stops that.
+    pub fn end_session(&mut self) -> Result<Option<memory::Note>, String> {
+        if !self.wants_session_note() { return Ok(None); }
+        self.cancel.reset(); // a stop meant for the last turn doesn't carry over
+        let summary = self.summarize(&self.msgs)?.ok_or("stopped while summarizing the session; no note was written")?;
+        self.write_session_note(&summary).map(Some)
+    }
+
+    fn write_session_note(&mut self, summary: &str) -> Result<memory::Note, String> {
+        let id = self.note_id();
+        let all = self.memory.notes();
+        // the title comes from where the session started, and stays when the note is rewritten
+        let title = all.iter().find(|n| n.id == id).map(|n| n.title.clone()).unwrap_or_else(|| {
+            let first = self.msgs.iter().find(|m| m.role == "user" && !m.content.starts_with(SUMMARY_MARK)).map_or("", |m| m.content.as_str());
+            format!("Session: {}", memory::short_title(first))
+        });
+        // only notes still there: one deleted during the session would be a dead link
+        let links: Vec<String> = self.used.borrow().iter().filter(|u| **u != id && all.iter().any(|n| n.id == **u)).map(|u| format!("[[{u}]]")).collect();
+        let mut body = summary.trim().to_string();
+        if !links.is_empty() { body += &format!("\n\nNotes used in this session: {}", links.join(" ")); }
+        let note = self.memory.put(&id, memory::NewNote { title, body, kind: "session".into(), source: Some(self.session_id.clone()) })?;
+        self.note_due = false;
+        Ok(note)
     }
 
     /// Remove the last user turn and everything after it; returns that user text.
@@ -506,6 +572,9 @@ impl Agent {
         Some(text)
     }
 }
+
+/// How a compressed conversation's summary starts.
+const SUMMARY_MARK: &str = "[Summary of the earlier conversation]";
 
 /// Sent back instead of running a tool call identical to the one in the previous step.
 const REPEAT_NOTE: &str = "Not run again: this is exactly the same call as your previous step, and its result is above. \

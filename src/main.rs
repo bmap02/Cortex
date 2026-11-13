@@ -402,7 +402,19 @@ fn chat(cfg: Config, resume: Option<String>) {
     }
     let _ = rl.save_history(&config::history_path());
     agent.save();
+    write_session_note(&mut agent);
     println!("{}", ui::faint(&format!("session saved: {}  (resume with: cortex -r {})", agent.session_id, agent.session_id)));
+}
+
+/// The session is ending: save its summary to long-term memory, if it's long enough to need one.
+fn write_session_note(agent: &mut Agent) {
+    if !agent.wants_session_note() { return; }
+    println!("{}", ui::faint("writing a session note… (Ctrl+C skips it)"));
+    match agent.end_session() {
+        Ok(Some(n)) => println!("{}", ui::faint(&format!("session note: {}", n.id))),
+        Ok(None) => {}
+        Err(e) => println!("{}", ui::error(&format!("no session note: {e}"))),
+    }
 }
 
 /// Handle a slash command. Returns false to quit.
@@ -416,6 +428,7 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
         }
         "/new" | "/reset" | "/clear" => {
             agent.save();
+            write_session_note(agent);
             agent.reset();
             // clear the screen and its scrollback, then start over from the banner
             if ui::color_on() { print!("\x1b[2J\x1b[3J\x1b[H"); }
@@ -476,6 +489,7 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
                         println!("{}", ui::faint(&format!("  started with {}; continuing with {} (/model {} to switch back)", s.model, agent.model, s.model)));
                     }
                     agent.save();
+                    write_session_note(agent);
                     agent.resume(s);
                 }
                 None => println!("{}", ui::error("no matching session (see /sessions)")),
