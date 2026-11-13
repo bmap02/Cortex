@@ -10,13 +10,16 @@ use std::sync::Once;
 pub struct MockServer { child: Child, pub port: u16 }
 
 impl MockServer {
-    pub fn start() -> MockServer {
+    pub fn start() -> MockServer { MockServer::start_on(0) }
+
+    /// On `port` (0 picks a free one), e.g. to bring a stopped server back where it was.
+    pub fn start_on(port: u16) -> MockServer {
         // tests/ at the repo root, found from whichever package's tests use this
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().map(|d| d.join("tests/mock_server.py"))
             .find(|p| p.exists()).expect("tests/mock_server.py in the repo");
         // python3 first; on Windows it can be a Store placeholder that prints nothing, so fall through
         for py in ["python3", "python"] {
-            let Ok(mut child) = Command::new(py).arg("-u").arg(&script).arg("0").stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { continue };
+            let Ok(mut child) = Command::new(py).arg("-u").arg(&script).arg(port.to_string()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { continue };
             let mut line = String::new();
             let _ = BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut line);
             match line.trim().strip_prefix("PORT ").and_then(|p| p.parse().ok()) {
@@ -28,6 +31,12 @@ impl MockServer {
     }
 
     pub fn url(&self) -> String { format!("http://127.0.0.1:{}", self.port) }
+
+    /// "Download" a model on it, as `ollama pull` would.
+    pub fn install(&self, model: &str) {
+        let mut r = ureq::post(&format!("{}/api/pull", self.url())).send_json(serde_json::json!({"model": model})).unwrap().into_reader();
+        std::io::copy(&mut r, &mut std::io::sink()).unwrap();
+    }
 }
 
 impl Drop for MockServer {

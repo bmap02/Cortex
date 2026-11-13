@@ -328,7 +328,8 @@ impl Agent {
         query.push(text);
         // not this session's own note: its summary is in the conversation already
         let own = self.note_id();
-        let mut notes = self.memory.recall(&query.join("\n"), 8, budget);
+        // the backend re-ranks by meaning when the server has an embedding model
+        let mut notes = self.memory.recall(&query.join("\n"), 8, budget, Some(&self.backend));
         notes.retain(|n| n.id != own);
         notes
     }
@@ -485,7 +486,7 @@ impl Agent {
                         declined = true;
                         "The user declined this action. Do not retry it or try a workaround; wait for their instructions.".to_string()
                     }
-                    Some(_) => tools::execute(&call.name, &call.args, &tools::ToolContext { cfg: &self.cfg, cancel: &self.cancel, session_id: &self.session_id, memory: &self.memory, used: &self.used, candidates: &self.candidates }),
+                    Some(_) => tools::execute(&call.name, &call.args, &tools::ToolContext { cfg: &self.cfg, cancel: &self.cancel, session_id: &self.session_id, memory: &self.memory, used: &self.used, candidates: &self.candidates, embedder: &self.backend }),
                 };
                 if let Some(c) = self.candidates.borrow().get(suggested) { emit(Event::MemoryCandidate(c.clone())); }
                 emit(Event::ToolFinished { result: result.clone() });

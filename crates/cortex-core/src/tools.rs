@@ -141,6 +141,8 @@ pub struct ToolContext<'a> {
     pub used: &'a std::cell::RefCell<std::collections::BTreeSet<String>>,
     /// Where `suggest_memory` puts what it proposes, until the user reviews it.
     pub candidates: &'a std::cell::RefCell<Vec<crate::memory::Candidate>>,
+    /// Re-ranks what `recall` finds by meaning, when there's an embedding model.
+    pub embedder: &'a dyn crate::memory::Embedder,
 }
 
 /// Run a tool.
@@ -430,7 +432,7 @@ fn html_to_text(html: &str) -> String {
 fn recall(a: &Value, ctx: &ToolContext) -> Result<String, String> {
     let query = arg(a, "query")?;
     // deeper than the automatic recall (more matches), and at most a quarter of the context
-    let notes = ctx.memory.recall(query, 20, ctx.cfg.num_ctx / 4);
+    let notes = ctx.memory.recall(query, 20, ctx.cfg.num_ctx / 4, Some(ctx.embedder));
     if notes.is_empty() { return Ok(format!("nothing in memory matches '{query}'")); }
     ctx.used.borrow_mut().extend(notes.iter().map(|n| n.id.clone()));
     Ok(notes.iter().map(|n| crate::memory::render_with_links(n, &ctx.memory.links(n))).collect::<Vec<_>>().join("\n"))

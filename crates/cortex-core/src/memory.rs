@@ -110,6 +110,16 @@ impl Proposal {
     }
 }
 
+/// Turns text into vectors whose closeness follows meaning (an embedding model). Optional: recall
+/// re-ranks its keyword hits with one when there is one.
+pub trait Embedder {
+    /// The model that makes the vectors, or None when there isn't one. Vectors from different
+    /// models can't be compared, so the cache is kept per model.
+    fn model(&self) -> Option<String>;
+    /// One vector per text, in order.
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String>;
+}
+
 pub struct Memory {
     dir: PathBuf,
 }
@@ -191,6 +201,7 @@ impl Memory {
             std::fs::remove_file(f).map_err(|e| format!("couldn't delete {}: {e}", f.display()))?;
         }
         let _ = std::fs::remove_file(self.dir.join(".index.json"));
+        let _ = std::fs::remove_file(self.dir.join(".embeddings.json"));
         Ok(files.len())
     }
 
@@ -346,8 +357,19 @@ impl Memory {
     /// notes one link away from them (in either direction), most relevant first, cut to
     /// `budget_tokens` as rendered by `render_recalled`. A note that doesn't fit is skipped for a
     /// smaller one after it; dead links (to deleted notes) are skipped too.
-    pub fn recall(&self, query: &str, hits: usize, budget_tokens: usize) -> Vec<Note> {
-        let hits: Vec<Note> = self.search(query, hits).into_iter().map(|h| h.note).collect();
+    ///
+    /// The matches are found by keywords. With an `embedder` that has a model, a wider set of
+    /// keyword matches is put in order of how close each note's meaning is to `query`, and the
+    /// best `hits` of those are taken; if embedding fails, keywords alone decide, as without one.
+    pub fn recall(&self, query: &str, hits: usize, budget_tokens: usize, embedder: Option<&dyn Embedder>) -> Vec<Note> {
+        let mut found: Vec<Note> = self.search(query, hits * 3).into_iter().map(|h| h.note).collect();
+        // the server is only asked about embeddings when there's more than one note to put in order
+        if found.len() > 1 && let Some(embedder) = embedder && let Some(model) = embedder.model()
+            && let Some(ordered) = self.by_meaning(query, &found, embedder, &model) {
+            found = ordered;
+        }
+        found.truncate(hits);
+        let hits = found;
         if hits.is_empty() { return vec![]; }
         let all = self.notes(); // read once for every hit's links
         let mut candidates: Vec<Note> = hits.clone();
@@ -395,6 +417,45 @@ impl Memory {
             .collect()
     }
 
+    /// `notes` in order of how close their meaning is to `query` (ties keep their order), or None
+    /// if embedding fails. Note vectors are cached in `.embeddings.json`, per model, and made again
+    /// only for notes whose file changed since; a missing or unreadable cache starts empty. Texts
+    /// go in batches, and each batch's vectors are kept even if a later one fails, so a slow
+    /// model gets through a large memory over several messages instead of failing it every time.
+    fn by_meaning(&self, query: &str, notes: &[Note], embedder: &dyn Embedder, model: &str) -> Option<Vec<Note>> {
+        const BATCH: usize = 16;
+        let path = self.dir.join(".embeddings.json");
+        let mut cache: Vectors = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok())
+            .filter(|c: &Vectors| c.model == model)
+            .unwrap_or_else(|| Vectors { model: model.to_string(), docs: HashMap::new() });
+        let stale: Vec<&Note> = notes.iter()
+            .filter(|n| !cache.docs.get(file_name(&n.path)).is_some_and(|v| Some(v.stamp) == stamp(&n.path))).collect();
+        let mut texts = vec![query.to_string()];
+        texts.extend(stale.iter().map(|n| format!("{}\n{}", n.title, n.body)));
+        let mut vectors: Vec<Vec<f32>> = vec![];
+        for batch in texts.chunks(BATCH) {
+            match embedder.embed(batch) {
+                Ok(v) if v.len() == batch.len() => vectors.extend(v),
+                _ => break,
+            }
+        }
+        // vectors[0] is the message's; the rest belong to the stale notes, in order
+        for (n, v) in stale.iter().zip(vectors.iter().skip(1)) {
+            if let Some(stamp) = stamp(&n.path) { cache.docs.insert(file_name(&n.path).to_string(), Vector { stamp, vector: v.clone() }); }
+        }
+        let names: HashSet<String> = self.files().iter().map(|p| file_name(p).to_string()).collect();
+        let before = cache.docs.len();
+        cache.docs.retain(|f, _| names.contains(f)); // notes deleted since
+        if (vectors.len() > 1 || cache.docs.len() != before) && self.dir.is_dir() {
+            let _ = self.write_whole(&path, &serde_json::to_string(&cache).unwrap_or_default());
+        }
+        if vectors.len() != texts.len() { return None; }
+        let score = |n: &Note| cache.docs.get(file_name(&n.path)).map_or(f32::MIN, |v| cosine(&vectors[0], &v.vector));
+        let mut ordered = notes.to_vec();
+        ordered.sort_by(|a, b| score(b).total_cmp(&score(a)));
+        Some(ordered)
+    }
+
     /// The .md files in the folder (not hidden ones).
     fn files(&self) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&self.dir).into_iter().flatten().flatten()
@@ -418,7 +479,7 @@ impl Memory {
         let mut seen = vec![];
         for file in self.files() {
             let Some(name) = file.file_name().and_then(|n| n.to_str()).map(String::from) else { continue };
-            let stamp = std::fs::metadata(&file).ok().map(|m| (modified_ns(&m), m.len()));
+            let stamp = stamp(&file);
             seen.push(name.clone());
             let current = index.docs.get(&name).is_some_and(|d| Some((d.modified_ns, d.size)) == stamp);
             if current { continue; }
@@ -466,6 +527,33 @@ impl Memory {
             let _ = self.add(NewNote { title: short_title(fact), body: fact.into(), kind: "fact".into(), source: None });
         }
     }
+}
+
+/// The note vectors one embedding model made, by file name.
+#[derive(Serialize, Deserialize)]
+struct Vectors {
+    model: String,
+    docs: HashMap<String, Vector>,
+}
+
+/// A note's vector, and the file's (modification time, size) when it was made.
+#[derive(Serialize, Deserialize)]
+struct Vector {
+    stamp: (u64, u64),
+    vector: Vec<f32>,
+}
+
+/// A file's modification time (ns) and size: whether a cache built from it is still current.
+fn stamp(path: &Path) -> Option<(u64, u64)> { std::fs::metadata(path).ok().map(|m| (modified_ns(&m), m.len())) }
+
+fn file_name(path: &Path) -> &str { path.file_name().and_then(|f| f.to_str()).unwrap_or_default() }
+
+/// How alike two vectors point: 1 the same direction, 0 unrelated.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let n = norm(a) * norm(b);
+    if n == 0.0 || a.len() != b.len() { 0.0 } else { dot / n }
 }
 
 const INDEX_VERSION: u32 = 1;

@@ -10,9 +10,11 @@ Asked to summarize the conversation (a request without tools), it lists the user
 /api/pull streams download progress and adds the model to /api/tags.
 For imports: /api/models/<repo>/tree/main lists a Hugging Face repo's files, /files/model.gguf is a
 GGUF to download (slowly, so it can be stopped), and /api/blobs + /api/create take an upload.
+/api/embed and /v1/embeddings embed text once an embedding model has been "pulled" (word counts
+with a few synonyms, so "feline" means "cat"); /debug/embedded says how many texts were embedded.
 Port 0 picks a free port and prints "PORT <n>" first, for tests that run several servers at once.
 """
-import hashlib, json, sys, time
+import hashlib, json, re, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def decide(messages):
@@ -56,6 +58,18 @@ def plain(messages):
     words = " ".join(f"word{i}" for i in range(200)) + " " if any("lengthy" in a for a in asked) else ""
     return ("text", words + "Summary: the user asked " + " | ".join(asked))
 
+SYNONYMS = {"feline": "cat", "kitty": "cat", "kitten": "cat"}
+EMBEDDED = [0]  # texts embedded so far
+
+def embed(text):
+    """A stand-in for an embedding: words (with synonyms folded together) hashed into 64 counts."""
+    v = [0.0] * 64
+    for w in re.findall(r"[a-z0-9]+", text.lower()):
+        w = SYNONYMS.get(w, w)
+        v[int(hashlib.md5(w.encode()).hexdigest(), 16) % 64] += 1.0
+    EMBEDDED[0] += 1
+    return v
+
 LAST_CHAT = {}  # the last chat request, for tests to see exactly what the model was sent
 PULLED = []  # models "downloaded" through /api/pull or created through /api/create
 BLOBS = set()  # sha256 digests uploaded to /api/blobs
@@ -85,8 +99,10 @@ class H(BaseHTTPRequestHandler):
                        + [{"name": n, "size": 1.9e9, "details": {}} for n in PULLED]})
         elif self.path == "/debug/last-request":
             self._json(LAST_CHAT)
+        elif self.path == "/debug/embedded":
+            self._json({"texts": EMBEDDED[0]})
         elif self.path == "/v1/models":
-            self._json({"data": [{"id": "mock-7b"}]})
+            self._json({"data": [{"id": "mock-7b"}] + [{"id": n} for n in PULLED]})
         elif self.path.startswith("/api/models/") and "/tree/main" in self.path:
             self._json(HF_TREE if "Qwen2.5-7B-Instruct-GGUF" in self.path else {"error": "Repository not found"}, 200 if "Qwen2.5-7B-Instruct-GGUF" in self.path else 404)
         elif self.path == "/files/model.gguf":
@@ -140,6 +156,14 @@ class H(BaseHTTPRequestHandler):
             for s in ["verifying sha256 digest", "writing manifest", "success"]: send({"status": s})
             if body["model"] not in PULLED: PULLED.append(body["model"])
             return
+        if self.path in ("/api/embed", "/v1/embeddings"):
+            if body.get("model") not in PULLED:
+                return self._json({"error": f'model "{body.get("model")}" not found, try pulling it first'}, 404)
+            texts = body["input"] if isinstance(body["input"], list) else [body["input"]]
+            vectors = [embed(t) for t in texts]
+            if self.path == "/api/embed":
+                return self._json({"model": body["model"], "embeddings": vectors})
+            return self._json({"data": [{"index": i, "embedding": v} for i, v in enumerate(vectors)]})
         if self.path == "/api/show":
             return self._json({"model_info": {"general.architecture": "qwen2", "qwen2.context_length": 32768}})
         if body.get("model") == "notools" and body.get("tools"):

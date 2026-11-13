@@ -18,3 +18,25 @@ fn memories_suggested_in_a_one_shot_run_are_left_with_a_way_to_review_them() {
     assert!(stderr.contains("1 suggested memory") && stderr.contains("cortex -r "), "told where to review it: {stderr}");
     assert!(!stdout.contains("suggested memory"), "the answer on stdout stays clean for pipes: {stdout}");
 }
+
+#[test]
+fn doctor_says_whether_semantic_recall_is_on() {
+    let server = common::MockServer::start();
+    let home = std::env::temp_dir().join(format!("cortex_cli_doctor_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.toml"), format!("backend = \"ollama\"\nbase_url = \"{}\"\nmodel = \"mock:7b\"\n", server.url())).unwrap();
+    let doctor = || {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cortex")).arg("doctor").env("CORTEX_HOME", &home).env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null()).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let out = doctor();
+    assert!(out.contains("semantic recall off") && out.contains("ollama pull nomic-embed-text"), "{out}");
+    server.install("nomic-embed-text");
+    assert!(doctor().contains("semantic recall on (nomic-embed-text)"), "{}", doctor());
+    // an OpenAI-compatible server gets its own hint
+    let fresh = common::MockServer::start(); // one with no embedding model
+    std::fs::write(home.join("config.toml"), format!("backend = \"openai\"\nbase_url = \"{}/v1\"\nmodel = \"mock-7b\"\n", fresh.url())).unwrap();
+    assert!(doctor().contains("load an embedding model in your server"), "{}", doctor());
+}

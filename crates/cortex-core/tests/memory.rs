@@ -224,28 +224,28 @@ fn pets(name: &str) -> Memory {
 #[test]
 fn recall_brings_matching_notes_and_their_neighbours() {
     let mem = pets("recall");
-    let ids: Vec<String> = mem.recall("what is my cat called?", 8, 1000).into_iter().map(|n| n.id).collect();
+    let ids: Vec<String> = mem.recall("what is my cat called?", 8, 1000, None).into_iter().map(|n| n.id).collect();
     assert_eq!(ids[0], "cat", "the best match first: {ids:?}");
     assert!(ids.contains(&"vet".to_string()), "one link away (the cat links to it): {ids:?}");
     assert!(ids.contains(&"food".to_string()), "one link away (it links to the cat): {ids:?}");
     assert!(!ids.contains(&"coffee".to_string()), "unrelated: {ids:?}");
     // [[Gone]] points nowhere: skipped, nothing breaks
-    assert!(mem.recall("zebra", 8, 1000).is_empty());
+    assert!(mem.recall("zebra", 8, 1000, None).is_empty());
 }
 
 #[test]
 fn recall_never_goes_over_its_budget() {
     let mem = pets("budget");
     let tokens = |notes: &[cortex_core::memory::Note]| notes.iter().map(cortex_core::memory::recall_tokens).sum::<usize>();
-    let all = mem.recall("cat biscuit", 8, 1000);
+    let all = mem.recall("cat biscuit", 8, 1000, None);
     let full = tokens(&all);
     assert!(all.len() >= 3);
     for budget in [0, 5, full / 2, full - 1, full] {
-        let some = mem.recall("cat biscuit", 8, budget);
+        let some = mem.recall("cat biscuit", 8, budget, None);
         assert!(tokens(&some) <= budget, "budget {budget}: used {}", tokens(&some));
     }
-    assert_eq!(mem.recall("cat biscuit", 8, full).len(), all.len());
-    assert!(mem.recall("cat biscuit", 8, 0).is_empty());
+    assert_eq!(mem.recall("cat biscuit", 8, full, None).len(), all.len());
+    assert!(mem.recall("cat biscuit", 8, 0, None).is_empty());
 }
 
 #[test]
@@ -300,7 +300,7 @@ fn consolidation_proposes_merging_near_duplicates_and_changes_nothing_until_appl
 #[test]
 fn consolidation_proposes_links_between_related_notes() {
     use cortex_core::memory::Proposal;
-    let mem = Memory::open(&home("links"));
+    let mem = Memory::open(&home("consolidate_links"));
     add(&mem, "Cat", "The cat Biscuit sleeps on the piano all day.");
     add(&mem, "Piano", "The piano in the living room is a Yamaha the cat sleeps on.");
     add(&mem, "Coffee", "Black coffee every morning.");
@@ -407,4 +407,149 @@ fn many_dead_links_dont_crowd_out_merges_and_links() {
     let props = mem.consolidation();
     assert_eq!(props.len(), 10);
     assert!(props.iter().any(|p| matches!(p, Proposal::Merge { .. })) && props.iter().any(|p| matches!(p, Proposal::Link { .. })), "{props:?}");
+}
+
+// ---------------------------------------------------------------- semantic re-ranking
+
+use cortex_core::memory::Embedder;
+use std::sync::Mutex;
+
+/// Embeds by counting a few words ("feline" counts as "cat"), and records the texts of each call.
+/// `works_for` calls succeed, then it fails (None: always works).
+struct Fake { model: Option<String>, works_for: Option<usize>, calls: Mutex<Vec<Vec<String>>> }
+impl Fake {
+    fn new(model: &str) -> Fake { Fake { model: Some(model.into()), works_for: None, calls: Mutex::new(vec![]) } }
+    fn without_model() -> Fake { Fake { model: None, ..Fake::new("") } }
+    fn failing_after(calls: usize) -> Fake { Fake { works_for: Some(calls), ..Fake::new("nomic-embed-text") } }
+    fn calls(&self) -> Vec<Vec<String>> { self.calls.lock().unwrap().clone() }
+}
+impl Embedder for Fake {
+    fn model(&self) -> Option<String> { self.model.clone() }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.push(texts.to_vec());
+        if self.works_for.is_some_and(|n| calls.len() > n) { return Err("the embedding model stopped".into()); }
+        Ok(texts.iter().map(|t| {
+            let t = t.to_lowercase();
+            [&["cat", "feline"][..], &["shop"], &["pet"], &["food"]].iter().map(|ws| ws.iter().map(|w| t.matches(w).count() as f32).sum()).collect()
+        }).collect())
+    }
+}
+
+const ASK: &str = "tell me about my feline pet";
+
+/// A cat note and a pet-shop note: by keywords the shop wins ("pet" four times), by meaning the cat.
+fn cat_and_pet_shop(name: &str) -> (PathBuf, Memory) {
+    let h = home(name);
+    let mem = Memory::open(&h);
+    add(&mem, "Cat", "Biscuit is the user's pet cat.");
+    add(&mem, "Pet shop", "The pet shop sells pet food, pet beds and pet toys.");
+    (h, mem)
+}
+
+fn ids(notes: Vec<cortex_core::memory::Note>) -> Vec<String> { notes.into_iter().map(|n| n.id).collect() }
+
+#[test]
+fn with_an_embedding_model_recall_puts_the_closest_meaning_first() {
+    let (_, mem) = cat_and_pet_shop("sem_order");
+    assert_eq!(ids(mem.recall(ASK, 8, 1000, None)), ["pet-shop", "cat"], "keywords alone");
+    assert_eq!(ids(mem.recall(ASK, 8, 1000, Some(&Fake::new("nomic-embed-text")))), ["cat", "pet-shop"], "re-ranked by meaning");
+    // with room for one note, the one that means the most gets it
+    let one = mem.recall(ASK, 1, 1000, Some(&Fake::new("nomic-embed-text")));
+    assert_eq!(ids(one), ["cat"]);
+}
+
+#[test]
+fn without_an_embedding_model_recall_is_exactly_keyword_recall() {
+    let (h, mem) = cat_and_pet_shop("sem_none");
+    let none = Fake::without_model();
+    assert_eq!(ids(mem.recall(ASK, 8, 1000, Some(&none))), ids(mem.recall(ASK, 8, 1000, None)));
+    assert!(none.calls().is_empty(), "nothing is embedded");
+    assert!(!h.join("memory").join(".embeddings.json").exists());
+    // and an embedding model that fails partway falls back to keywords for that message
+    let failing = Fake::failing_after(0);
+    assert_eq!(ids(mem.recall(ASK, 8, 1000, Some(&failing))), ["pet-shop", "cat"]);
+    // and nothing from the failed call is kept: once the model works, the notes are embedded
+    let working = Fake::new("nomic-embed-text");
+    assert_eq!(ids(mem.recall(ASK, 8, 1000, Some(&working))), ["cat", "pet-shop"]);
+    assert_eq!(working.calls()[0].len(), 3);
+}
+
+#[test]
+fn note_vectors_are_cached_and_made_again_only_when_needed() {
+    let (h, mem) = cat_and_pet_shop("sem_cache");
+    let cache = h.join("memory").join(".embeddings.json");
+    let e = Fake::new("nomic-embed-text");
+    mem.recall(ASK, 8, 1000, Some(&e));
+    assert_eq!(e.calls()[0].len(), 3, "the message and both notes, in one call");
+    assert!(cache.exists(), "kept beside the keyword index");
+    mem.recall(ASK, 8, 1000, Some(&e));
+    assert_eq!(e.calls()[1], [ASK.to_string()], "only the message: the notes come from the cache");
+
+    // an edited note gets a new vector; the other doesn't
+    std::fs::write(h.join("memory").join("cat.md"), "---\ntitle: Cat\n---\nBiscuit is the user's pet cat, a fluffy one.\n").unwrap();
+    mem.recall(ASK, 8, 1000, Some(&e));
+    assert_eq!(e.calls()[2].len(), 2, "the message and the edited note: {:?}", e.calls()[2]);
+    assert!(e.calls()[2][1].contains("fluffy"));
+
+    // a missing cache, a broken one, or another model's vectors: made again
+    std::fs::remove_file(&cache).unwrap();
+    mem.recall(ASK, 8, 1000, Some(&e));
+    assert_eq!(e.calls()[3].len(), 3);
+    std::fs::write(&cache, "not json").unwrap();
+    mem.recall(ASK, 8, 1000, Some(&e));
+    assert_eq!(e.calls()[4].len(), 3);
+    let other = Fake::new("mxbai-embed-large");
+    mem.recall(ASK, 8, 1000, Some(&other));
+    assert_eq!(other.calls()[0].len(), 3, "vectors from another model can't be compared");
+    mem.clear().unwrap();
+    assert!(!cache.exists(), "clearing memory clears the vectors too");
+}
+
+#[test]
+fn notes_are_embedded_in_batches_so_progress_survives_a_failure() {
+    let mem = Memory::open(&home("sem_batch"));
+    // cats and dogs alternate: keywords prefer the short dog notes, meaning the cat ones
+    for i in 0..20 {
+        let body = if i % 2 == 0 { format!("Pet number {i} is a cat, a cat called Biscuit{i} who sleeps all day.") } else { format!("Pet dog {i}.") };
+        add(&mem, &format!("Pet {i}"), &body);
+    }
+    let flaky = Fake::failing_after(1);
+    assert_eq!(ids(mem.recall(ASK, 8, 100_000, Some(&flaky))), ids(mem.recall(ASK, 8, 100_000, None)),
+        "a failure partway means keywords alone, not an order from half the vectors");
+    let calls = flaky.calls();
+    assert_eq!(calls[0].len(), 16, "the message and 15 notes, then the rest in a second call");
+    assert_eq!(calls[1].len(), 5);
+    let working = Fake::new("nomic-embed-text");
+    mem.recall(ASK, 8, 100_000, Some(&working));
+    assert_eq!(working.calls(), [working.calls()[0].clone()]);
+    assert_eq!(working.calls()[0].len(), 6, "the 15 kept from before aren't embedded again");
+}
+
+#[test]
+fn vectors_of_deleted_notes_are_dropped_from_the_cache() {
+    let (h, mem) = cat_and_pet_shop("sem_prune");
+    add(&mem, "Dog", "Rex is the user's pet dog.");
+    let e = Fake::new("nomic-embed-text");
+    mem.recall(ASK, 8, 1000, Some(&e));
+    std::fs::remove_file(h.join("memory").join("pet-shop.md")).unwrap();
+    mem.recall(ASK, 8, 1000, Some(&e));
+    let cache = std::fs::read_to_string(h.join("memory").join(".embeddings.json")).unwrap();
+    assert!(cache.contains("cat.md") && !cache.contains("pet-shop.md"), "{cache}");
+}
+
+#[test]
+fn with_nothing_to_rank_the_embedding_model_is_never_asked_for() {
+    let h = home("sem_quiet");
+    let mem = Memory::open(&h);
+    let asked = std::cell::Cell::new(0);
+    struct Counting<'a>(&'a std::cell::Cell<u32>);
+    impl Embedder for Counting<'_> {
+        fn model(&self) -> Option<String> { self.0.set(self.0.get() + 1); Some("nomic-embed-text".into()) }
+        fn embed(&self, _: &[String]) -> Result<Vec<Vec<f32>>, String> { Err("not expected".into()) }
+    }
+    mem.recall(ASK, 8, 1000, Some(&Counting(&asked)));
+    add(&mem, "Cat", "Biscuit is the user's pet cat.");
+    mem.recall(ASK, 8, 1000, Some(&Counting(&asked)));
+    assert_eq!(asked.get(), 0, "empty memory, then a single match: nothing to put in order, so no call to the server");
 }

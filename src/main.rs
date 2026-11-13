@@ -543,6 +543,19 @@ fn run_once(cfg: Config, prompt: String, quiet: bool, no_tools: bool) -> i32 {
 
 // ---------------------------------------------------------------- setup & management
 
+/// The model offered by default in setup (numbered from 1): the current one, else the first chat
+/// model. An embedding model can't chat, and Ollama lists the newest pull first, which is often one.
+fn default_pick(models: &[backend::ModelInfo], current: &str) -> usize {
+    models.iter().position(|m| m.name == current)
+        .or_else(|| models.iter().position(|m| !backend::is_embedding_model(&m.name)))
+        .map_or(1, |i| i + 1)
+}
+
+/// What a model list says about a model; embedding models are marked, since they can't chat.
+fn model_detail(m: &backend::ModelInfo) -> String {
+    if backend::is_embedding_model(&m.name) { format!("{}  embedding model: for memory, not chat", m.detail).trim().to_string() } else { m.detail.clone() }
+}
+
 fn ask(q: &str, default: &str) -> String {
     if default.is_empty() { print!("{q}: "); } else { print!("{q} {}: ", ui::faint(&format!("[{default}]"))); }
     let _ = std::io::stdout().flush();
@@ -578,7 +591,7 @@ fn setup() {
     match Backend::new(&cfg).list_models() {
         Ok(models) if !models.is_empty() => {
             println!("{}", ui::muted(&format!("found {} model(s)", models.len())));
-            for (i, m) in models.iter().enumerate() { println!("  {:>2}) {}  {}", i + 1, m.name, ui::faint(&m.detail)); }
+            for (i, m) in models.iter().enumerate() { println!("  {:>2}) {}  {}", i + 1, m.name, ui::faint(&model_detail(m))); }
             let ollama = cfg.backend == BackendKind::Ollama;
             let top = models::top_names(&cfg, 3);
             if ollama && !top.is_empty() {
@@ -586,7 +599,7 @@ fn setup() {
             } else if !top.is_empty() {
                 println!("  {}", ui::faint(&format!("models that suit this machine, to load in your server: {}", top.join(", "))));
             }
-            let def = models.iter().position(|m| m.name == cfg.model).map(|i| (i + 1).to_string()).unwrap_or("1".into());
+            let def = default_pick(&models, &cfg.model).to_string();
             let pick = ask("model number or name", &def);
             if ollama && pick.eq_ignore_ascii_case("new") {
                 if let Some(id) = models::choose_for_setup(&cfg) { cfg.model = id; }
@@ -636,7 +649,7 @@ fn print_models(cfg: &Config) -> i32 {
             if models.is_empty() { println!("{}", ui::muted("no models on the server")); }
             for m in models {
                 let mark = if m.name == cfg.model { ui::bold(ui::DOT) } else { ui::faint("○") };
-                println!("  {mark} {:<36} {}", m.name, ui::faint(&m.detail));
+                println!("  {mark} {:<36} {}", m.name, ui::faint(&model_detail(&m)));
             }
             0
         }
@@ -930,6 +943,17 @@ fn doctor(cfg: &Config) -> i32 {
     if cfg.model.is_empty() { bad("no default model: `cortex model <name>`"); return 1; }
     if models.iter().any(|m| m.name == cfg.model || m.name == format!("{}:latest", cfg.model)) { ok(&format!("model {} is available", cfg.model)) }
     else { bad(&format!("model {} not found on the server", cfg.model)) }
+    // optional, so its absence isn't a failure
+    match models.iter().map(|m| m.name.as_str()).find(|n| backend::is_embedding_model(n)) {
+        Some(m) => match be.embed(m, &["a test".to_string()]) {
+            Ok(_) => ok(&format!("semantic recall on ({m})")),
+            Err(e) => bad(&format!("semantic recall: {m} is there but didn't embed ({e}); recall uses keywords alone")),
+        },
+        None => println!("  {} {}", ui::faint("·"), ui::faint(&format!("semantic recall off: no embedding model ({})", match cfg.backend {
+            BackendKind::Ollama => "`ollama pull nomic-embed-text` turns it on",
+            BackendKind::Openai => "load an embedding model in your server to turn it on",
+        }))),
+    }
 
     print!("  … testing a reply and tool calling ");
     let _ = std::io::stdout().flush();
@@ -959,6 +983,17 @@ mod tests {
         assert!(!s.contains("Registry"), "a cargo install leaves PATH alone");
         let s = windows_cleanup_script(Path::new(r"C:\x\Programs\cortex\cortex.exe"), Path::new(r"C:\x\Programs\cortex"), true);
         assert!(s.contains("Registry") && s.contains("-Recurse"), "the installer folder is removed and taken off PATH");
+    }
+
+    #[test]
+    fn setup_never_suggests_an_embedding_model_for_chat() {
+        use cortex_core::backend::ModelInfo;
+        let models: Vec<ModelInfo> = ["nomic-embed-text:latest", "qwen2.5:7b", "llama3.1:8b"].iter()
+            .map(|n| ModelInfo { name: n.to_string(), detail: String::new() }).collect();
+        assert_eq!(super::default_pick(&models, ""), 2, "the newest pull is the embedding model; skip it");
+        assert_eq!(super::default_pick(&models, "llama3.1:8b"), 3, "the current model stays the default");
+        let only: Vec<ModelInfo> = vec![ModelInfo { name: "nomic-embed-text".into(), detail: String::new() }];
+        assert_eq!(super::default_pick(&only, ""), 1);
     }
 
     #[test]

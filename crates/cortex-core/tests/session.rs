@@ -556,3 +556,79 @@ fn reviewed_tidy_ups_are_carried_out_through_the_session() {
     agent.accept(&fix, Some("cat")).unwrap();
     assert_eq!(agent.memory.find(&old.id).unwrap().body, "Saw [[cat]] once.");
 }
+
+// ---------------------------------------------------------------- semantic recall
+
+/// An agent whose memory holds a cat note and a pet-shop note (see the memory tests).
+fn agent_with_pet_notes(server: &MockServer, name: &str) -> Agent {
+    use cortex_core::memory::{Memory, NewNote};
+    let mut agent = agent(server);
+    agent.memory = Memory::open(&scratch_dir(&format!("semantic_{name}")));
+    for (title, body) in [("Cat", "Biscuit is the user's pet cat."), ("Pet shop", "The pet shop sells pet food, pet beds and pet toys.")] {
+        agent.memory.add(NewNote { title: title.into(), body: body.into(), kind: "fact".into(), source: None }).unwrap();
+    }
+    agent
+}
+
+fn recalled(agent: &mut Agent, text: &str) -> Vec<String> {
+    let mut titles = vec![];
+    agent.send(text, |e| if let Event::Recalled { notes } = e { titles = notes }).unwrap();
+    titles
+}
+
+
+fn embedded(server: &MockServer) -> u64 {
+    let v: serde_json::Value = ureq::get(&format!("{}/debug/embedded", server.url())).call().unwrap().into_json().unwrap();
+    v["texts"].as_u64().unwrap()
+}
+
+#[test]
+fn an_installed_embedding_model_is_used_for_recall_with_no_setup() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pet_notes(&server, "ollama");
+    assert_eq!(recalled(&mut agent, "tell me about my feline pet"), ["Pet shop", "Cat"], "no embedding model: keywords alone");
+    assert_eq!(embedded(&server), 0);
+
+    server.install("nomic-embed-text");
+    let mut agent = agent_with_pet_notes(&server, "ollama2");
+    assert_eq!(recalled(&mut agent, "tell me about my feline pet"), ["Cat", "Pet shop"], "found and used without any setting");
+    assert_eq!(embedded(&server), 3, "the message and both notes");
+    recalled(&mut agent, "tell me about my feline pet");
+    assert_eq!(embedded(&server), 4, "the notes' vectors are reused");
+}
+
+#[test]
+fn embedding_models_on_openai_compatible_servers_are_used_too() {
+    let server = MockServer::start();
+    server.install("text-embedding-nomic-embed-text-v1.5");
+    let mut agent = agent_with_pet_notes(&server, "openai");
+    agent.cfg.backend = cortex_core::config::BackendKind::Openai;
+    agent.cfg.base_url = format!("{}/v1", server.url());
+    agent.backend = cortex_core::backend::Backend::new(&agent.cfg);
+    assert_eq!(recalled(&mut agent, "tell me about my feline pet"), ["Cat", "Pet shop"]);
+}
+
+#[test]
+fn the_recall_tool_puts_the_closest_meaning_first_too() {
+    let server = MockServer::start();
+    server.install("nomic-embed-text");
+    let mut agent = agent_with_pet_notes(&server, "tool");
+    agent.cfg.memory_budget = 0.0; // only the tool
+    let (_, trace) = run_turn(&mut agent, "recall feline pet", Approval::Deny);
+    let (cat, shop) = (trace[1].find("## Cat").unwrap(), trace[1].find("## Pet shop").unwrap());
+    assert!(cat < shop, "{}", trace[1]);
+}
+
+#[test]
+fn a_server_that_was_down_when_first_asked_is_asked_again() {
+    use cortex_core::memory::Embedder;
+    let server = MockServer::start();
+    let port = server.port;
+    let cfg = Config { base_url: server.url(), model: "mock:7b".into(), ..Config::default() };
+    drop(server);
+    let backend = cortex_core::backend::Backend::new(&cfg);
+    assert_eq!(backend.model(), None, "the server is down: keywords alone for now");
+    let server = MockServer::start_on(port);
+    server.install("nomic-embed-text");
+    assert_eq!(backend.model().as_deref(), Some("nomic-embed-text"), "not remembered as \"no model\"");
+}

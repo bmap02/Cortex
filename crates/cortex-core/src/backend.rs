@@ -86,6 +86,8 @@ pub struct Backend {
     base: String,
     key: Option<String>,
     agent: ureq::Agent,
+    /// The server's embedding model (Some(None): it has none), once it has answered.
+    embedding_model: std::sync::Mutex<Option<Option<String>>>,
 }
 
 impl Backend {
@@ -95,6 +97,7 @@ impl Backend {
             base: cfg.base_url.trim_end_matches('/').to_string(),
             key: cfg.api_key(),
             agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(5)).build(),
+            embedding_model: std::sync::Mutex::new(None),
         }
     }
 
@@ -177,6 +180,28 @@ impl Backend {
         self.ollama_only()?;
         let resp = self.req("POST", "/api/pull").send_json(json!({"model": model, "stream": true})).map_err(Self::err)?;
         Self::follow_status(resp, cancel, on_progress, "the download ended before it finished")
+    }
+
+
+    /// Vectors for `texts` from embedding model `model`, one per text, in order.
+    pub fn embed(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, BackendError> {
+        let bad = |what: &str| BackendError::Other(format!("the server sent {what} instead of embeddings"));
+        let path = match self.kind { BackendKind::Ollama => "/api/embed", BackendKind::Openai => "/embeddings" };
+        // the first call loads the model; after that one is quick
+        let v: Value = self.req("POST", path).timeout(Duration::from_secs(60)).send_json(json!({"model": model, "input": texts}))
+            .map_err(Self::err)?.into_json().map_err(|_| bad("something unreadable"))?;
+        let list: Vec<Value> = match self.kind {
+            BackendKind::Ollama => v["embeddings"].as_array().cloned().ok_or_else(|| bad("no list"))?,
+            BackendKind::Openai => {
+                let mut data = v["data"].as_array().cloned().ok_or_else(|| bad("no list"))?;
+                data.sort_by_key(|d| d["index"].as_u64().unwrap_or(0));
+                data.into_iter().map(|d| d["embedding"].clone()).collect()
+            }
+        };
+        let vectors: Vec<Vec<f32>> = list.iter().map(|e| e.as_array().map(|xs| xs.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect()))
+            .collect::<Option<_>>().ok_or_else(|| bad("a vector that isn't one"))?;
+        if vectors.len() != texts.len() { return Err(bad(&format!("{} vectors for {} texts", vectors.len(), texts.len()))); }
+        Ok(vectors)
     }
 
     /// Ollama only: whether the server has `model` (also under its :latest tag).
@@ -392,6 +417,32 @@ impl Reply {
     }
 }
 
+/// Whether a model's name says it makes embeddings rather than chat: nomic-embed-text,
+/// mxbai-embed-large, snowflake-arctic-embed, granite-embedding, LM Studio's text-embedding-…,
+/// all-minilm and the bge family.
+pub fn is_embedding_model(name: &str) -> bool {
+    let n = name.to_lowercase();
+    let base = n.rsplit('/').next().unwrap_or(&n);
+    n.contains("embed") || base.starts_with("all-minilm") || base.starts_with("bge")
+}
+
+/// Recall's embeddings come from the model server. Its embedding model is looked for the first time
+/// one is needed and remembered for the session; with none, recall uses keywords alone. A server
+/// that doesn't answer isn't taken to have none: it's asked again next time.
+impl crate::memory::Embedder for Backend {
+    fn model(&self) -> Option<String> {
+        let mut known = self.embedding_model.lock().unwrap_or_else(|e| e.into_inner());
+        if known.is_none() && let Ok(models) = self.list_models() {
+            *known = Some(models.into_iter().map(|m| m.name).find(|n| is_embedding_model(n)));
+        }
+        known.clone().flatten()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        let model = crate::memory::Embedder::model(self).ok_or("no embedding model")?;
+        Backend::embed(self, &model, texts).map_err(|e| e.to_string())
+    }
+}
+
 /// Reads a file being uploaded, reporting progress and stopping when cancelled.
 struct ProgressReader<'a, R> {
     inner: R,
@@ -421,6 +472,17 @@ mod tests {
         assert!(is_tool_parse_error("error parsing tool call: invalid JSON"));
         assert!(!is_tool_parse_error("can't reach the server: connection refused"));
     }
+    #[test]
+    fn embedding_models_are_told_apart_from_chat_models_by_name() {
+        for m in ["nomic-embed-text:latest", "mxbai-embed-large", "snowflake-arctic-embed:110m", "granite-embedding:30m",
+                  "all-minilm", "bge-m3", "text-embedding-nomic-embed-text-v1.5", "hf.co/CompendiumLabs/bge-base-en-v1.5-gguf"] {
+            assert!(super::is_embedding_model(m), "{m}");
+        }
+        for m in ["qwen2.5:7b", "llama3.1:8b", "lukey03/qwen3.5-9b-abliterated-vision:latest", "gemma3:4b"] {
+            assert!(!super::is_embedding_model(m), "{m}");
+        }
+    }
+
     #[test]
     fn empty_reply_falls_back_to_thinking() {
         let mut shown = String::new();
