@@ -27,7 +27,7 @@ Windows, macOS and Linux. It is a single ~5 MB Rust binary with no telemetry, an
   give plain Markdown)
 - **Agent tools**: read, write, patch, list and search files; run shell commands and Python;
   exact math; long-term memory
-- **Approval before changes**: shell commands, Python, file writes and new memories ask y/n/always first, and
+- **Approval before changes**: shell commands, Python, file writes, web fetches and new memories ask y/n/always first, and
   one "no" stops the agent and hands control back to you
 - **Cross-platform**: PowerShell on Windows, `sh` on macOS/Linux, colors in every modern terminal
 - **Sessions** are saved automatically and can be resumed with `cortex -r`, or `/resume last` in a chat
@@ -276,8 +276,8 @@ cortex update                   # update to the latest release
 cortex uninstall                # remove Cortex (asks before deleting your data)
 ```
 
-In `run` mode with piped input, nobody is at the keyboard to approve changes, so the tools that
-ask first stay off unless `auto_approve = true`.
+In `run` mode with piped input, nobody is at the keyboard to approve anything, so the tools that
+ask first (web fetches included) stay off unless `auto_approve = true`.
 
 ### Context window
 
