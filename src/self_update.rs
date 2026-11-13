@@ -18,13 +18,8 @@ pub fn install_windows(repo: &str, tag: &str, dir: &Path, say: impl Fn(&str)) ->
     say(&format!("Downloading {rel}/{WINDOWS_ASSET}"));
     let zip = download(&format!("{rel}/{WINDOWS_ASSET}"))?;
     let sums = download(&format!("{rel}/SHA256SUMS.txt")).ok().map(|b| String::from_utf8_lossy(&b).into_owned());
-    match sums.as_deref().and_then(|s| expected_sha256(s, WINDOWS_ASSET)) {
-        Some(expected) if expected != sha256_hex(&zip) => {
-            return Err(format!("checksum mismatch for {WINDOWS_ASSET}: the download may be corrupted or tampered with. Cortex was not updated."));
-        }
-        Some(_) => say("Checksum OK"),
-        None => say(&format!("Warning: no checksum found for {WINDOWS_ASSET}; skipping verification.")),
-    }
+    verify(&zip, sums.as_deref())?;
+    say("Checksum OK");
     let exe_bytes = extract(&zip, "cortex.exe")?;
     let exe = dir.join("cortex.exe");
     let new = dir.join("cortex.exe.new");
@@ -52,6 +47,17 @@ fn download(url: &str) -> Result<Vec<u8>, String> {
     // the release zip is a few MB; anything far bigger isn't it
     resp.into_reader().take(200_000_000).read_to_end(&mut body).map_err(|e| format!("download of {url} broke off: {e}"))?;
     Ok(body)
+}
+
+/// Check the downloaded release zip against SHA256SUMS.txt (`sums`, None if it couldn't be
+/// downloaded). Every release publishes one, so a missing checksum fails the update too: the
+/// download can't be told apart from a swapped one.
+pub fn verify(zip: &[u8], sums: Option<&str>) -> Result<(), String> {
+    match sums.and_then(|s| expected_sha256(s, WINDOWS_ASSET)) {
+        Some(expected) if expected == sha256_hex(zip) => Ok(()),
+        Some(_) => Err(format!("checksum mismatch for {WINDOWS_ASSET}: the download may be corrupted or tampered with. Cortex was not updated.")),
+        None => Err(format!("couldn't get the checksum for {WINDOWS_ASSET} (SHA256SUMS.txt), so the download can't be verified. Cortex was not updated; try again later.")),
+    }
 }
 
 /// The SHA-256 that SHA256SUMS.txt lists for `file` ("<hash>  <file>", or "*<file>" in binary mode).
@@ -85,6 +91,17 @@ mod tests {
         let sums = "0aa1  cortex-aarch64-apple-darwin.tar.gz\nABCD12 *cortex-x86_64-pc-windows-msvc.zip\n";
         assert_eq!(expected_sha256(sums, WINDOWS_ASSET).as_deref(), Some("abcd12"));
         assert_eq!(expected_sha256(sums, "cortex-x86_64-unknown-linux-gnu.tar.gz"), None);
+    }
+
+    #[test]
+    fn an_update_installs_only_a_download_that_matches_its_checksum() {
+        let zip = b"the release zip";
+        let sums = |hash: &str| format!("{hash}  {WINDOWS_ASSET}\n0aa1  cortex-aarch64-apple-darwin.tar.gz\n");
+        assert!(verify(zip, Some(&sums(&sha256_hex(zip)))).is_ok());
+        assert!(verify(zip, Some(&sums("0bad"))).unwrap_err().contains("mismatch"));
+        // every release publishes a checksum: without one, nothing says the download is the release
+        assert!(verify(zip, None).is_err(), "the checksum file didn't download");
+        assert!(verify(zip, Some("0aa1  cortex-aarch64-apple-darwin.tar.gz\n")).is_err(), "it doesn't list the asset");
     }
 
     #[test]

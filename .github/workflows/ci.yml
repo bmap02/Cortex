@@ -26,6 +26,17 @@ jobs:
           if CORTEX_VERSION=v0.0.0-missing CORTEX_INSTALL_DIR="$RUNNER_TEMP/bin2" sh install.sh; then
             echo "install.sh should have failed for a missing version"; exit 1
           fi
+          # a release without SHA256SUMS.txt must fail too: the download can't be verified
+          mirror="$RUNNER_TEMP/mirror"; mkdir -p "$mirror/download/v9.9.9"
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            cp "$RUNNER_TEMP/bin/cortex" "$mirror/download/v9.9.9/cortex-$t.tar.gz"
+          done
+          python3 -m http.server 18765 --bind 127.0.0.1 --directory "$mirror" & sleep 2
+          if CORTEX_RELEASES_URL=http://127.0.0.1:18765 CORTEX_VERSION=v9.9.9 CORTEX_INSTALL_DIR="$RUNNER_TEMP/bin3" sh install.sh; then
+            echo "install.sh should have failed without a checksum"; exit 1
+          fi
+          test ! -e "$RUNNER_TEMP/bin3/cortex"
+          kill %1
       - name: install.ps1 (Windows PowerShell, as with irm | iex)
         if: runner.os == 'Windows'
         shell: powershell

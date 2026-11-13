@@ -65,8 +65,10 @@
                 if ($parts.Count -eq 2 -and $parts[1].TrimStart('*') -eq $File) { $Expected = $parts[0].ToLower() }
             }
         } catch { }
+        # every release publishes one: without it the download can't be told apart from a swapped one
         if (-not $Expected) {
-            Write-Host "Warning: no checksum found for $File; skipping verification." -ForegroundColor Yellow
+            Write-Host "Couldn't get the checksum for $File (SHA256SUMS.txt), so the download can't be verified." -ForegroundColor Red
+            throw "Cortex was not installed; try again later."
         } else {
             $Actual = (Get-FileHash -Algorithm SHA256 -Path $Zip).Hash.ToLower()
             if ($Actual -ne $Expected) {

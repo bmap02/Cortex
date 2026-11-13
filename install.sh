@@ -74,8 +74,11 @@ if fetch "$rel/SHA256SUMS.txt" "$tmp/SHA256SUMS.txt" 2>/dev/null; then
   expected="$(awk -v f="$file" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS.txt")"
 fi
 actual="$(sha256 "$tmp/$file" || true)"
+# every release publishes one: without it the download can't be told apart from a swapped one
 if [ -z "$expected" ]; then
-  echo "Warning: no checksum found for $file; skipping verification." >&2
+  echo "Couldn't get the checksum for $file (SHA256SUMS.txt), so the download can't be verified." >&2
+  echo "Cortex was not installed; try again later." >&2
+  exit 1
 elif [ -z "$actual" ]; then
   echo "Warning: sha256sum/shasum not found; skipping checksum verification." >&2
 elif [ "$expected" != "$actual" ]; then
