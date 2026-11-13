@@ -543,12 +543,23 @@ fn run_once(cfg: Config, prompt: String, quiet: bool, no_tools: bool) -> i32 {
 
 // ---------------------------------------------------------------- setup & management
 
-/// The model offered by default in setup (numbered from 1): the current one, else the first chat
-/// model. An embedding model can't chat, and Ollama lists the newest pull first, which is often one.
-fn default_pick(models: &[backend::ModelInfo], current: &str) -> usize {
-    models.iter().position(|m| m.name == current)
-        .or_else(|| models.iter().position(|m| !backend::is_embedding_model(&m.name)))
-        .map_or(1, |i| i + 1)
+/// A server's models split into the ones that can chat and the names of its embedding models,
+/// which can't: setup offers only the first, and lists the others apart (recall uses them).
+fn chat_and_embedding(models: Vec<backend::ModelInfo>) -> (Vec<backend::ModelInfo>, Vec<String>) {
+    let (embedding, chat): (Vec<_>, Vec<_>) = models.into_iter().partition(|m| backend::is_embedding_model(&m.name));
+    (chat, embedding.into_iter().map(|m| m.name).collect())
+}
+
+/// The chat model offered by default in setup (numbered from 1): the current one, else the first.
+fn default_pick(chat: &[backend::ModelInfo], current: &str) -> usize {
+    chat.iter().position(|m| m.name == current).map_or(1, |i| i + 1)
+}
+
+/// The note under setup's list: embedding models aren't choices, recall uses them by itself.
+fn embedding_note(names: &[String]) {
+    if !names.is_empty() {
+        println!("  {}", ui::faint(&format!("for memory, not chat (recall uses it automatically): {}", names.join(", "))));
+    }
 }
 
 /// What a model list says about a model; embedding models are marked, since they can't chat.
@@ -588,10 +599,11 @@ fn setup() {
 
     print!("{}", ui::muted("connecting... "));
     let _ = std::io::stdout().flush();
-    match Backend::new(&cfg).list_models() {
-        Ok(models) if !models.is_empty() => {
-            println!("{}", ui::muted(&format!("found {} model(s)", models.len())));
-            for (i, m) in models.iter().enumerate() { println!("  {:>2}) {}  {}", i + 1, m.name, ui::faint(&model_detail(m))); }
+    match Backend::new(&cfg).list_models().map(chat_and_embedding) {
+        Ok((models, embedding)) if !models.is_empty() => {
+            println!("{}", ui::muted(&format!("found {} chat model(s)", models.len())));
+            for (i, m) in models.iter().enumerate() { println!("  {:>2}) {}  {}", i + 1, m.name, ui::faint(&m.detail)); }
+            embedding_note(&embedding);
             let ollama = cfg.backend == BackendKind::Ollama;
             let top = models::top_names(&cfg, 3);
             if ollama && !top.is_empty() {
@@ -607,8 +619,9 @@ fn setup() {
                 cfg.model = pick.parse::<usize>().ok().and_then(|i| models.get(i.wrapping_sub(1))).map(|m| m.name.clone()).unwrap_or(pick);
             }
         }
-        Ok(_) => {
-            println!("{}", ui::muted("connected, but the server has no models."));
+        Ok((_, embedding)) => {
+            println!("{}", ui::muted("connected, but the server has no chat models."));
+            embedding_note(&embedding);
             if cfg.backend == BackendKind::Ollama {
                 if let Some(id) = models::choose_for_setup(&cfg) { cfg.model = id; }
             } else {
@@ -986,14 +999,16 @@ mod tests {
     }
 
     #[test]
-    fn setup_never_suggests_an_embedding_model_for_chat() {
+    fn setup_numbers_only_chat_models_and_lists_embedding_models_apart() {
         use cortex_core::backend::ModelInfo;
-        let models: Vec<ModelInfo> = ["nomic-embed-text:latest", "qwen2.5:7b", "llama3.1:8b"].iter()
+        let models: Vec<ModelInfo> = ["nomic-embed-text:latest", "qwen2.5:7b", "llama3.1:8b", "mxbai-embed-large"].iter()
             .map(|n| ModelInfo { name: n.to_string(), detail: String::new() }).collect();
-        assert_eq!(super::default_pick(&models, ""), 2, "the newest pull is the embedding model; skip it");
-        assert_eq!(super::default_pick(&models, "llama3.1:8b"), 3, "the current model stays the default");
-        let only: Vec<ModelInfo> = vec![ModelInfo { name: "nomic-embed-text".into(), detail: String::new() }];
-        assert_eq!(super::default_pick(&only, ""), 1);
+        let (chat, embedding) = super::chat_and_embedding(models);
+        let names: Vec<&str> = chat.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["qwen2.5:7b", "llama3.1:8b"], "only these can be picked by number");
+        assert_eq!(embedding, ["nomic-embed-text:latest", "mxbai-embed-large"]);
+        assert_eq!(super::default_pick(&chat, ""), 1);
+        assert_eq!(super::default_pick(&chat, "llama3.1:8b"), 2, "the current model stays the default");
     }
 
     #[test]
