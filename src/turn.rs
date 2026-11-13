@@ -28,8 +28,8 @@ impl TurnView {
         match e {
             // which memories came with the message, so it's clear where an answer's facts came from
             Event::Recalled { notes } => if !quiet { ui::outln(&ui::faint(&format!("  memory: {}", notes.join(", ")))) },
-            // reviewed when the session ends (or on /consolidate)
-            Event::MemoryCandidate(c) => if !quiet { ui::outln(&ui::faint(&format!("  memory candidate: {}", ui::clean(&c.body)))) },
+            // the suggest_memory tool line already shows it here; the event is for other front-ends
+            Event::MemoryCandidate(_) => {}
             Event::Compressing => if !quiet { ui::outln(&ui::faint("  (context nearly full: compressing earlier conversation)")) },
             Event::PlainChatFallback(m) => if !quiet {
                 ui::outln(&ui::faint(&format!("  ({}: {m}. Continuing as plain chat; pick a tool-capable model for agent features.)", self.model)));
