@@ -12,6 +12,7 @@ REPO="${CORTEX_REPO:-bmap02/Cortex}"
 VERSION="${CORTEX_VERSION:-latest}"
 DIR="${CORTEX_INSTALL_DIR:-$HOME/.local/bin}"
 BASE="${CORTEX_RELEASES_URL:-https://github.com/$REPO/releases}"
+BASE="${BASE%/}" # a mirror given with a trailing slash would make //latest/download
 
 case "$(uname -s)" in
   Linux)  os=unknown-linux-gnu ;;

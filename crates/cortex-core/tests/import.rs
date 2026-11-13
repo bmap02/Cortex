@@ -123,7 +123,6 @@ fn stopping_during_the_upload_ends_promptly_without_a_model() {
     assert!(!created.unwrap());
     assert_eq!(files_in(&work), 0);
     let _ = std::fs::remove_dir_all(&work);
-    drop(stop);
 }
 
 fn files_in(dir: &std::path::Path) -> usize { std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0) }

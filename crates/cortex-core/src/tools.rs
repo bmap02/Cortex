@@ -370,7 +370,7 @@ fn run_process(c: &mut Command, timeout: u64, cancel: &CancelHandle) -> Result<S
     let text = |b: &Mutex<Vec<u8>>| String::from_utf8_lossy(&b.lock().unwrap_or_else(|e| e.into_inner())).replace("\r\n", "\n");
     let (out, err) = (text(&out), text(&err));
     let mut s = String::new();
-    if !out.is_empty() { s += &out; }
+    s += &out;
     if !err.is_empty() { s += &format!("[stderr]\n{err}"); }
     match status {
         None => s += &format!("\n[killed after {}s]", start.elapsed().as_secs()),
@@ -398,9 +398,10 @@ fn drain(mut pipe: impl Read + Send + 'static) -> (Arc<Mutex<Vec<u8>>>, std::thr
 
 fn run_python(a: &Value, cancel: &CancelHandle) -> Result<String, String> {
     let code = arg(a, "code")?;
+    // look for Python first, so a machine without it isn't left with the script file
+    let py = python_exe().ok_or("Python isn't installed (tried python3, python, py)")?;
     let path = std::env::temp_dir().join(format!("cortex_{}.py", std::process::id()));
     std::fs::write(&path, code).map_err(|e| e.to_string())?;
-    let py = python_exe().ok_or("Python isn't installed (tried python3, python, py)")?;
     let r = run_process(Command::new(py).arg(&path).env("PYTHONIOENCODING", "utf-8"), 60, cancel);
     let _ = std::fs::remove_file(&path);
     r

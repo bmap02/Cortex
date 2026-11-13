@@ -85,6 +85,10 @@ fn deleting_and_clearing_memory_from_the_command_line() {
     let (code, _, err) = cortex(&h, &["delete", "nobody", "--yes"]);
     assert_eq!(code, 1);
     assert!(err.contains("no note called"), "{err}");
+    // the rm alias without a name gets the usage, like delete
+    let (code, _, err) = cortex(&h, &["rm"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("usage: cortex memory rm"), "{err}");
 
     let (code, out, _) = cortex(&h, &["clear", "--yes"]);
     assert_eq!(code, 0);

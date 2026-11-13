@@ -53,4 +53,3 @@ pub fn temp_home() {
         unsafe { std::env::set_var("CORTEX_HOME", home) };
     });
 }
-

@@ -13,7 +13,7 @@ pub fn run(action: &str, args: &[String], yes: bool) -> i32 {
     let arg = args.join(" ");
     match (action, arg.trim()) {
         ("list", _) => { list(&mem); 0 }
-        ("show" | "links" | "search" | "delete", "") => {
+        ("show" | "links" | "search" | "delete" | "rm", "") => {
             eprintln!("usage: cortex memory {action} <{}>", if action == "search" { "words" } else { "note id or title" });
             2
         }

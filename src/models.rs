@@ -138,7 +138,8 @@ pub fn install(cfg: &Config, target: Option<String>, use_it: bool) -> i32 {
 /// Make `id` the default model: with --use, or if the user says so at a terminal.
 fn offer_switch(cfg: &Config, id: &str, use_it: bool) -> i32 {
     let switch = use_it || (cfg.model != id && std::io::stdin().is_terminal()
-        && crate::ask(&format!("use {id} from now on? [Y/n]"), "y").eq_ignore_ascii_case("y"));
+        // the [Y/n] says what Enter means; ask's own default hint would show it twice
+        && matches!(crate::ask(&format!("use {id} from now on? [Y/n]"), "").to_lowercase().as_str(), "" | "y" | "yes"));
     if !switch { return 0; }
     match Config::update(|c| { c.model = id.to_string(); Ok(()) }) {
         Ok(()) => { println!("{}", ui::muted(&format!("default model → {id}"))); 0 }
@@ -212,7 +213,7 @@ fn confirm_fit(cfg: &Config, size: Option<(f64, bool)>, yes: bool) -> bool {
         eprintln!("{}", ui::error("It probably won't fit in this machine's memory. Add --yes to download it anyway."));
         return false;
     }
-    crate::ask("It probably won't fit in this machine's memory. Download it anyway? [y/N]", "n").eq_ignore_ascii_case("y")
+    crate::ask("It probably won't fit in this machine's memory. Download it anyway? [y/N]", "").eq_ignore_ascii_case("y")
 }
 
 /// Download a GGUF from `url` and create it in Ollama as `id`, with progress. Ctrl+C stops it.

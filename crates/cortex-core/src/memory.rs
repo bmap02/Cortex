@@ -705,11 +705,11 @@ pub fn render_with_links(n: &Note, links: &Links) -> String {
     s
 }
 
-/// Text on one line, with runs of spaces and line breaks made single spaces.
 /// A note's text without the "Related:" links added when a suggested memory was saved: the fact
 /// as it was suggested.
 pub fn fact_of(body: &str) -> &str { body.split("\n\nRelated: ").next().unwrap_or(body).trim() }
 
+/// Text on one line, with runs of spaces and line breaks made single spaces.
 pub fn one_line(s: &str) -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") }
 
 /// The note with this id, or else this title (in any case).

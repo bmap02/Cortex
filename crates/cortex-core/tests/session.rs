@@ -576,7 +576,6 @@ fn recalled(agent: &mut Agent, text: &str) -> Vec<String> {
     titles
 }
 
-
 fn embedded(server: &MockServer) -> u64 {
     let v: serde_json::Value = ureq::get(&format!("{}/debug/embedded", server.url())).call().unwrap().into_json().unwrap();
     v["texts"].as_u64().unwrap()

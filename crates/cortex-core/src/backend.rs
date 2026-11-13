@@ -182,7 +182,6 @@ impl Backend {
         Self::follow_status(resp, cancel, on_progress, "the download ended before it finished")
     }
 
-
     /// Vectors for `texts` from embedding model `model`, one per text, in order.
     pub fn embed(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, BackendError> {
         let bad = |what: &str| BackendError::Other(format!("the server sent {what} instead of embeddings"));
