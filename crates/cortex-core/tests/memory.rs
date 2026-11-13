@@ -167,3 +167,38 @@ fn migrating_from_two_windows_at_once_converts_the_file_once() {
     assert_eq!(Memory::open(&h).notes().len(), 20, "no fact twice, none lost");
     assert!(h.join("MEMORY.md.bak").exists());
 }
+
+#[test]
+fn deleting_a_note_leaves_links_to_it_dead_but_harmless() {
+    let h = home("delete");
+    let mem = Memory::open(&h);
+    added(mem.add(note("Cat", "The cat is called Biscuit; see [[Vet]].")).unwrap());
+    added(mem.add(note("Vet", "The vet is Dr Lee.")).unwrap());
+
+    let gone = mem.delete("Vet").unwrap();
+    assert_eq!(gone.deleted.id, "vet");
+    assert_eq!(gone.linked_from.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["cat"], "says which notes now have a dead link");
+    assert!(!h.join("memory").join("vet.md").exists());
+    assert!(mem.delete("vet").is_err(), "already gone");
+
+    // the dead link is shown as unresolved, and nothing else minds
+    let links = mem.links(&mem.find("cat").unwrap());
+    assert!(links.outgoing[0].note.is_none());
+    assert_eq!(mem.search("dr lee", 5).len(), 0);
+    assert_eq!(mem.search("biscuit", 5)[0].note.id, "cat");
+}
+
+#[test]
+fn clearing_memory_deletes_the_notes_and_nothing_else() {
+    let h = home("clear");
+    let mem = Memory::open(&h);
+    added(mem.add(note("One", "First fact.")).unwrap());
+    added(mem.add(note("Two", "Second fact.")).unwrap());
+    mem.search("fact", 5); // writes the index
+    std::fs::write(h.join("memory").join("keep.txt"), "not a note").unwrap();
+
+    assert_eq!(mem.clear().unwrap(), 2);
+    assert!(mem.notes().is_empty());
+    assert!(mem.search("fact", 5).is_empty());
+    assert!(h.join("memory").join("keep.txt").exists(), "only notes (and the index) are removed");
+}

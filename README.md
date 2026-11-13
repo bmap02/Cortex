@@ -265,6 +265,7 @@ cortex models import hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M   # a GGUF 
 cortex models import https://example.com/model.gguf --name my-model    # or from any URL
 cortex model qwen2.5:7b         # set the default model
 cortex memory list              # long-term memory notes; also: show <note>, search <words>, links <note>
+cortex memory delete <note>     # delete one note (or `cortex memory clear` for all of them)
 cortex tools                    # list tools; cortex tools disable run_shell
 cortex tools enable fetch_url   # let the agent read web pages (turns on network access)
 cortex config                   # show settings; cortex config set num_ctx 16384

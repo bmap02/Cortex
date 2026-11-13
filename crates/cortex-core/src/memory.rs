@@ -51,6 +51,12 @@ pub struct Links {
     pub incoming: Vec<Note>,
 }
 
+pub struct Deleted {
+    pub deleted: Note,
+    /// Notes whose `[[links]]` pointed to it, and now point nowhere.
+    pub linked_from: Vec<Note>,
+}
+
 pub struct Hit {
     pub note: Note,
     pub score: f64,
@@ -110,6 +116,26 @@ impl Memory {
         std::io::Write::write_all(&mut file, text.as_bytes()).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
         drop(file);
         read_note(&path).map(Added::Created).ok_or_else(|| format!("couldn't read back {}", path.display()))
+    }
+
+    /// Delete one note (by id or title). Links to it stay in other notes' text, now pointing
+    /// nowhere; the result says which notes have them.
+    pub fn delete(&self, id_or_title: &str) -> Result<Deleted, String> {
+        let note = self.find(id_or_title).ok_or_else(|| format!("no note called '{}'", id_or_title.trim()))?;
+        let linked_from = self.links(&note).incoming;
+        std::fs::remove_file(&note.path).map_err(|e| format!("couldn't delete {}: {e}", note.path.display()))?;
+        Ok(Deleted { deleted: note, linked_from })
+    }
+
+    /// Delete every note, and the index. Other files in the folder are left alone. Returns how many
+    /// notes were deleted.
+    pub fn clear(&self) -> Result<usize, String> {
+        let files = self.files();
+        for f in &files {
+            std::fs::remove_file(f).map_err(|e| format!("couldn't delete {}: {e}", f.display()))?;
+        }
+        let _ = std::fs::remove_file(self.dir.join(".index.json"));
+        Ok(files.len())
     }
 
     /// The links in a note, resolved, and the notes that link to it.

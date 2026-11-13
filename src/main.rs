@@ -81,12 +81,15 @@ enum Cmd {
         key: Option<String>,
         value: Option<String>,
     },
-    /// Long-term memory: `cortex memory list`, `show <note>`, `search <words>`, `links <note>`, `path`
+    /// Long-term memory: `cortex memory list`, `show <note>`, `search <words>`, `links <note>`, `delete <note>`, `clear`
     Memory {
-        /// list | show | search | links | path
+        /// list | show | search | links | delete | clear | path
         action: Option<String>,
         /// A note's id or title, or the words to search for
         args: Vec<String>,
+        /// Delete without asking
+        #[arg(short, long)]
+        yes: bool,
     },
     /// List saved sessions, or remove them: `cortex sessions clear`, `cortex sessions delete <id>`
     Sessions {
@@ -174,7 +177,7 @@ fn main() {
         },
         Cmd::Tools { action, name } => tools_cmd(&cfg, action, name),
         Cmd::Config { action, key, value } => config_cmd(action, key, value),
-        Cmd::Memory { action, args } => memory_cmd::run(action.as_deref().unwrap_or("list"), &args),
+        Cmd::Memory { action, args, yes } => memory_cmd::run(action.as_deref().unwrap_or("list"), &args, yes),
         Cmd::Sessions { action, id, yes } => sessions_cmd(action.as_deref().unwrap_or("list"), id.as_deref().unwrap_or(""), yes),
         Cmd::Doctor => doctor(&cfg),
         Cmd::Update => update(),
@@ -448,18 +451,7 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
             ui::muted(&format!("context: ~{} / {} tokens · {} messages", agent.ctx_used(), agent.cfg.num_ctx, agent.msgs.len()))),
         "/memory" => memory_cmd::list(&cortex_core::memory::Memory::open(&config::home())),
         "/forget" => {
-            let mem = cortex_core::memory::Memory::open(&config::home());
-            let n = mem.notes().len();
-            if n == 0 { println!("{}", ui::muted("memory is already empty")); return true; }
-            // one notes folder now, not one file: ask, since this can't be undone
-            if !ask(&format!("delete all {}? [y/N]", ui::plural(n, "memory note")), "").eq_ignore_ascii_case("y") {
-                println!("{}", ui::muted("kept them"));
-                return true;
-            }
-            match std::fs::remove_dir_all(mem.dir()) {
-                Ok(()) => println!("{}", ui::muted("memory cleared")),
-                Err(e) => println!("{}", ui::error(&format!("couldn't delete {}: {e}", mem.dir().display()))),
-            }
+            memory_cmd::clear(&cortex_core::memory::Memory::open(&config::home()), false);
             agent.msgs[0].content = agent::system_prompt(&agent.cfg);
         }
         "/sessions" => {
@@ -690,7 +682,11 @@ fn sessions_cmd(action: &str, id: &str, yes: bool) -> i32 {
                 return 0;
             }
             match agent::delete_sessions(None) {
-                Ok(d) => { println!("{}", ui::muted(&format!("deleted {}", ui::plural(d, "session")))); 0 }
+                Ok(d) => {
+                    println!("{}", ui::muted(&format!("deleted {}", ui::plural(d, "session"))));
+                    println!("{}", ui::faint("  memory notes are kept (`cortex memory clear` deletes those)"));
+                    0
+                }
                 Err(e) => { eprintln!("{}", ui::error(&e)); 1 }
             }
         }

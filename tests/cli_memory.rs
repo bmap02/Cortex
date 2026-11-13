@@ -55,3 +55,51 @@ fn an_empty_memory_says_so() {
     assert!(out.contains("no memories yet"), "{out}");
     let _ = std::fs::remove_dir_all(&h);
 }
+
+#[test]
+fn deleting_and_clearing_memory_from_the_command_line() {
+    let h = home("delete");
+    let dir = h.join("memory");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(h.join("sessions")).unwrap();
+    std::fs::write(dir.join("cat.md"), "---\ntitle: Cat\nsource: 20261113-090000\n---\nThe cat is called Biscuit; see [[vet]].\n").unwrap();
+    std::fs::write(dir.join("vet.md"), "---\ntitle: Vet\n---\nThe vet is Dr Lee.\n").unwrap();
+    std::fs::write(dir.join("dog.md"), "---\ntitle: Dog\n---\nNo dog.\n").unwrap();
+
+    // the session the cat note came from was cleared away
+    let (_, out, _) = cortex(&h, &["show", "cat"]);
+    assert!(out.contains("from session 20261113-090000 (deleted)"), "{out}");
+
+    // nobody to ask (not a terminal) and no --yes: nothing is deleted
+    let (code, _, _) = cortex(&h, &["delete", "vet"]);
+    assert_eq!(code, 1);
+    assert!(dir.join("vet.md").exists());
+
+    let (code, out, _) = cortex(&h, &["delete", "vet", "--yes"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!dir.join("vet.md").exists());
+    assert!(out.contains("cat"), "names the notes that still link to it: {out}");
+    let (_, out, _) = cortex(&h, &["show", "cat"]);
+    assert!(out.contains("→ vet  (no note called 'vet')"), "{out}");
+
+    let (code, _, err) = cortex(&h, &["delete", "nobody", "--yes"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("no note called"), "{err}");
+
+    let (code, out, _) = cortex(&h, &["clear", "--yes"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("deleted 2 notes"), "{out}");
+    assert!(cortex(&h, &["list"]).1.contains("no memories yet"));
+    let _ = std::fs::remove_dir_all(&h);
+}
+
+#[test]
+fn clearing_sessions_says_memory_is_kept() {
+    let h = home("sessions");
+    std::fs::create_dir_all(h.join("sessions")).unwrap();
+    std::fs::write(h.join("sessions").join("20261113-090000.json"), r#"{"id":"20261113-090000","model":"m","created":0,"messages":[]}"#).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_cortex")).args(["sessions", "clear", "--yes"]).env("CORTEX_HOME", &h).output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("deleted 1 session") && out.contains("memory notes are kept"), "{out}");
+    let _ = std::fs::remove_dir_all(&h);
+}
