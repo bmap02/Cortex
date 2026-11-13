@@ -452,7 +452,7 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
         "/memory" => memory_cmd::list(&cortex_core::memory::Memory::open(&config::home())),
         "/forget" => {
             memory_cmd::clear(&cortex_core::memory::Memory::open(&config::home()), false);
-            agent.msgs[0].content = agent::system_prompt(&agent.cfg);
+            agent.msgs[0].content = agent::system_prompt(&agent.cfg, &agent.memory);
         }
         "/sessions" => {
             let (action, id) = arg.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((arg, ""));

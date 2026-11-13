@@ -334,6 +334,7 @@ auto_approve = false
 allow_network = false         # enables fetch_url
 show_banner = true
 disabled_tools = []
+memory_budget = 0.1           # share of the context window for recalled memories (0 = off)
 ```
 
 ## Project layout

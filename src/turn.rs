@@ -26,6 +26,8 @@ impl TurnView {
     fn show(&mut self, e: Event) {
         let quiet = self.quiet;
         match e {
+            // which memories came with the message, so it's clear where an answer's facts came from
+            Event::Recalled { notes } => if !quiet { ui::outln(&ui::faint(&format!("  memory: {}", notes.join(", ")))) },
             Event::Compressing => if !quiet { ui::outln(&ui::faint("  (context nearly full: compressing earlier conversation)")) },
             Event::PlainChatFallback(m) => if !quiet {
                 ui::outln(&ui::faint(&format!("  ({}: {m}. Continuing as plain chat; pick a tool-capable model for agent features.)", self.model)));

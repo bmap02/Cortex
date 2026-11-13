@@ -49,6 +49,8 @@ pub struct Config {
     pub show_banner: bool,
     /// Tools to turn off, e.g. ["run_shell"].
     pub disabled_tools: Vec<String>,
+    /// The share of the context window for memories recalled into each message (0 turns it off).
+    pub memory_budget: f64,
 }
 
 impl Default for Config {
@@ -66,6 +68,7 @@ impl Default for Config {
             allow_network: false,
             show_banner: true,
             disabled_tools: vec![],
+            memory_budget: 0.10,
         }
     }
 }
@@ -119,6 +122,9 @@ pub fn history_path() -> PathBuf { home().join("history.txt") }
 
 impl Config {
     pub fn exists() -> bool { config_path().exists() }
+
+    /// Tokens of recalled memory each message may carry.
+    pub fn memory_tokens(&self) -> usize { (self.num_ctx as f64 * self.memory_budget) as usize }
 
     pub fn load() -> Config {
         Config::read_from(&config_path()).unwrap_or_else(|e| {
@@ -183,6 +189,12 @@ impl Config {
             "auto_approve" => self.auto_approve = b(value)?,
             "allow_network" => self.allow_network = b(value)?,
             "show_banner" => self.show_banner = b(value)?,
+            "memory_budget" => {
+                let v: f64 = value.trim_end_matches('%').parse().map_err(|_| "memory_budget expects a share like 0.1 (or 10%)")?;
+                let v = if value.ends_with('%') { v / 100.0 } else { v };
+                if !(0.0..=0.5).contains(&v) { return Err("memory_budget must be between 0 (off) and 0.5".into()); }
+                self.memory_budget = v;
+            }
             _ => return Err(format!("unknown key '{key}'")),
         }
         Ok(())

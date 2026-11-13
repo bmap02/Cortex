@@ -26,7 +26,7 @@ pub struct Tool {
 /// Every built-in tool, built once at compile time.
 pub fn all() -> &'static [Tool] { &TOOLS }
 
-static TOOLS: [Tool; 10] = [
+static TOOLS: [Tool; 11] = [
         Tool { name: "read_file", group: "file", summary: "read a text file (with line numbers)", needs_approval: false, network: false,
             params: || json!({"type":"object","properties":{
                 "path":{"type":"string"},
@@ -58,6 +58,8 @@ static TOOLS: [Tool; 10] = [
             params: || json!({"type":"object","properties":{"expression":{"type":"string","description":"e.g. (3.5*12)^2 / sqrt(2)"}},"required":["expression"]}) },
         Tool { name: "fetch_url", group: "web", summary: "fetch a web page as text", needs_approval: false, network: true,
             params: || json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}) },
+        Tool { name: "recall", group: "memory", summary: "search long-term memory", needs_approval: false, network: false,
+            params: || json!({"type":"object","properties":{"query":{"type":"string","description":"what to look for, in a few words"}},"required":["query"]}) },
         Tool { name: "remember", group: "memory", summary: "save a fact to long-term memory", needs_approval: true, network: false,
             params: || json!({"type":"object","properties":{
                 "fact":{"type":"string","description":"one short durable fact about the user or project"},
@@ -95,6 +97,7 @@ pub fn describe(name: &str, a: &Value) -> String {
         "calculator" => s("expression"),
         "fetch_url" => s("url"),
         "remember" => s("fact"),
+        "recall" => s("query"),
         _ => a.to_string(),
     }
 }
@@ -123,6 +126,8 @@ pub struct ToolContext<'a> {
     pub cancel: &'a CancelHandle,
     /// Recorded as the source of what `remember` saves.
     pub session_id: &'a str,
+    /// Where `remember` saves and `recall` searches.
+    pub memory: &'a crate::memory::Memory,
 }
 
 /// Run a tool.
@@ -140,7 +145,8 @@ pub fn execute(name: &str, a: &Value, ctx: &ToolContext) -> String {
             .map(|v| if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", v as i64) } else { format!("{v}") }),
         "fetch_url" if cfg.allow_network => fetch_url(a),
         "fetch_url" => Err("network access is off (Cortex is offline by default). Run `cortex config set allow_network true` to enable.".into()),
-        "remember" => remember(a, ctx.session_id),
+        "remember" => remember(a, ctx),
+        "recall" => recall(a, ctx),
         _ => Err(format!("unknown tool '{name}'")),
     };
     let out = match r { Ok(s) => s, Err(e) => format!("ERROR: {e}") };
@@ -386,13 +392,23 @@ fn html_to_text(html: &str) -> String {
     BLANK_LINES.replace_all(&t, "\n\n").trim().to_string()
 }
 
+/// Search long-term memory: the matching notes and the notes linked to them, with each note's links.
+fn recall(a: &Value, ctx: &ToolContext) -> Result<String, String> {
+    let query = arg(a, "query")?;
+    // deeper than the automatic recall (more matches), and at most a quarter of the context
+    let notes = ctx.memory.recall(query, 20, ctx.cfg.num_ctx / 4);
+    if notes.is_empty() { return Ok(format!("nothing in memory matches '{query}'")); }
+    Ok(notes.iter().map(|n| crate::memory::render_with_links(n, &ctx.memory.links(n))).collect::<Vec<_>>().join("\n"))
+}
+
 /// Save a fact as a memory note (see memory.rs), noting the session it came from.
-fn remember(a: &Value, session_id: &str) -> Result<String, String> {
-    use crate::memory::{short_title, Added, Memory, NewNote};
+fn remember(a: &Value, ctx: &ToolContext) -> Result<String, String> {
+    use crate::memory::{short_title, Added, NewNote};
+    let session_id = ctx.session_id;
     let fact = crate::memory::one_line(arg(a, "fact")?);
     let kind = a["kind"].as_str().filter(|k| ["preference", "project"].contains(k)).unwrap_or("fact");
     let source = (!session_id.is_empty()).then(|| session_id.to_string());
-    match Memory::open(&config::home()).add(NewNote { title: short_title(&fact), body: fact, kind: kind.into(), source })? {
+    match ctx.memory.add(NewNote { title: short_title(&fact), body: fact, kind: kind.into(), source })? {
         Added::Created(n) => Ok(format!("saved to memory as [[{}]]", n.id)),
         Added::Exists(n) => Ok(format!("already remembered in [[{}]]", n.id)),
     }

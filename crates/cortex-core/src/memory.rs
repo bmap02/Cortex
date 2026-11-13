@@ -139,14 +139,34 @@ impl Memory {
     }
 
     /// The links in a note, resolved, and the notes that link to it.
-    pub fn links(&self, note: &Note) -> Links {
-        let notes = self.notes();
-        let resolve = |target: &str| lookup(&notes, target).cloned();
-        let outgoing = wikilinks(&note.body).into_iter().map(|t| Link { note: resolve(&t), target: t }).collect();
-        let incoming = notes.iter()
-            .filter(|n| n.id != note.id && wikilinks(&n.body).iter().any(|t| resolve(t).is_some_and(|r| r.id == note.id)))
-            .cloned().collect();
-        Links { outgoing, incoming }
+    pub fn links(&self, note: &Note) -> Links { links_among(&self.notes(), note) }
+
+    /// Whether there are no notes at all.
+    pub fn is_empty(&self) -> bool { self.files().is_empty() }
+
+    /// The notes to bring into a conversation about `query`: the best `hits` matches, then the
+    /// notes one link away from them (in either direction), most relevant first, cut to
+    /// `budget_tokens` as rendered by `render_recalled`. A note that doesn't fit is skipped for a
+    /// smaller one after it; dead links (to deleted notes) are skipped too.
+    pub fn recall(&self, query: &str, hits: usize, budget_tokens: usize) -> Vec<Note> {
+        let hits: Vec<Note> = self.search(query, hits).into_iter().map(|h| h.note).collect();
+        if hits.is_empty() { return vec![]; }
+        let all = self.notes(); // read once for every hit's links
+        let mut candidates: Vec<Note> = hits.clone();
+        for hit in &hits {
+            let links = links_among(&all, hit);
+            candidates.extend(links.outgoing.into_iter().filter_map(|l| l.note));
+            candidates.extend(links.incoming);
+        }
+        let (mut picked, mut used): (Vec<Note>, usize) = (vec![], 0);
+        for note in candidates {
+            if picked.iter().any(|p| p.id == note.id) { continue; }
+            let cost = recall_tokens(&note);
+            if used + cost > budget_tokens { continue; }
+            used += cost;
+            picked.push(note);
+        }
+        picked
     }
 
     /// The notes best matching `query` (BM25 over titles and text), best first.
@@ -342,6 +362,36 @@ pub fn short_title(fact: &str) -> String {
     let mut title = words.join(" ");
     if title.len() > 60 { title = title.chars().take(57).collect::<String>() + "..."; }
     title.trim_end_matches(['.', ',', ';', ':']).to_string()
+}
+
+/// A note's links resolved among `notes`, and the notes there that link to it.
+fn links_among(notes: &[Note], note: &Note) -> Links {
+    let resolve = |target: &str| lookup(notes, target).cloned();
+    let outgoing = wikilinks(&note.body).into_iter().map(|t| Link { note: resolve(&t), target: t }).collect();
+    let incoming = notes.iter()
+        .filter(|n| n.id != note.id && wikilinks(&n.body).iter().any(|t| resolve(t).is_some_and(|r| r.id == note.id)))
+        .cloned().collect();
+    Links { outgoing, incoming }
+}
+
+/// How a recalled note is shown to the model: its title, id (for `[[links]]`) and text.
+fn render_note(n: &Note) -> String { format!("## {} [[{}]]\n{}\n", n.title, n.id, n.body) }
+
+/// Roughly how many tokens a recalled note takes in `render_recalled` (4 characters a token, as
+/// for the context), counting the line that separates it from the next.
+pub fn recall_tokens(n: &Note) -> usize { (render_note(n).len() + 1).div_ceil(4) }
+
+/// Recalled notes as one block of text for the model.
+pub fn render_recalled(notes: &[Note]) -> String { notes.iter().map(render_note).collect::<Vec<_>>().join("\n") }
+
+/// A note as the `recall` tool returns it: the note, then which notes it links to and from.
+pub fn render_with_links(n: &Note, links: &Links) -> String {
+    let mut s = render_note(n);
+    let out: Vec<&str> = links.outgoing.iter().filter_map(|l| l.note.as_ref().map(|t| t.id.as_str())).collect();
+    let inc: Vec<&str> = links.incoming.iter().map(|t| t.id.as_str()).collect();
+    if !out.is_empty() { s += &format!("links to: {}\n", out.join(", ")); }
+    if !inc.is_empty() { s += &format!("linked from: {}\n", inc.join(", ")); }
+    s
 }
 
 /// Text on one line, with runs of spaces and line breaks made single spaces.

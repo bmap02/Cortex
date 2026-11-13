@@ -170,18 +170,120 @@ fn a_nearly_full_context_is_compressed_before_the_next_reply() {
 #[test]
 fn remember_saves_a_note_with_its_session_and_new_sessions_know_it() {
     let server = MockServer::start();
+    let home = scratch_dir("remember");
     let mut agent = agent(&server);
+    agent.memory = cortex_core::memory::Memory::open(&home);
     let (result, trace) = run_turn(&mut agent, "please remember that the user's cat is called Biscuit", Approval::AllowOnce);
     assert!(result.is_ok());
     assert!(trace.contains(&"approval remember".to_string()), "remembering still asks first: {trace:?}");
 
-    let home = std::path::PathBuf::from(std::env::var("CORTEX_HOME").unwrap());
-    let mem = cortex_core::memory::Memory::open(&home);
-    let note = mem.notes().into_iter().find(|n| n.body.contains("Biscuit")).expect("a note on disk");
+    let note = agent.memory.notes().into_iter().find(|n| n.body.contains("Biscuit")).expect("a note on disk");
     assert_eq!(note.source.as_deref(), Some(agent.session_id.as_str()));
     let text = std::fs::read_to_string(&note.path).unwrap();
     assert!(text.starts_with("---\n") && text.contains("kind: fact"), "{text}");
-    // until recall arrives (ticket 08), every session's prompt still carries the memories
-    let fresh = Agent::new(Config::default());
-    assert!(fresh.msgs[0].content.contains("the user's cat is called Biscuit"), "{}", fresh.msgs[0].content);
+    // a later session gets it back when it's relevant
+    let mut later = self::agent(&server);
+    later.memory = cortex_core::memory::Memory::open(&home);
+    later.send("what's my cat called?", |_| {}).unwrap();
+    assert!(sent_user_message(&server).contains("Biscuit"));
+}
+
+// ---------------------------------------------------------------- recall
+
+/// An agent whose memory is its own folder with a few notes: the cat note matches "cat" and links
+/// to the vet note; the coffee note is unrelated.
+fn agent_with_pets(server: &MockServer, name: &str) -> Agent {
+    use cortex_core::memory::{Memory, NewNote};
+    let mut agent = agent(server);
+    agent.memory = Memory::open(&scratch_dir(&format!("recall_{name}")));
+    for (title, body) in [("Cat", "The cat is called Biscuit. Her vet is [[Vet]]."), ("Vet", "Dr Lee at the corner clinic."), ("Coffee", "Drinks black coffee in the morning.")] {
+        agent.memory.add(NewNote { title: title.into(), body: body.into(), kind: "fact".into(), source: None }).unwrap();
+    }
+    agent
+}
+
+/// What the model was sent as the latest user message.
+fn sent_user_message(server: &MockServer) -> String {
+    let req: serde_json::Value = ureq::get(&format!("{}/debug/last-request", server.url())).call().unwrap().into_json().unwrap();
+    req["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn relevant_memories_and_their_linked_notes_come_with_the_message() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "inject");
+    let mut recalled = vec![];
+    agent.send("what is my cat called?", |e| if let Event::Recalled { notes } = e { recalled = notes }).unwrap();
+
+    let sent = sent_user_message(&server);
+    assert!(sent.contains("Biscuit"), "the matching note: {sent}");
+    assert!(sent.contains("Dr Lee"), "the note it links to: {sent}");
+    assert!(!sent.contains("coffee"), "not the unrelated note: {sent}");
+    assert!(sent.trim_end().ends_with("what is my cat called?"), "the user's own words come last: {sent}");
+    assert_eq!(recalled, ["Cat", "Vet"], "front-ends are told what was used");
+    // the conversation keeps what the user typed; the memories were only for that request
+    assert_eq!(agent.msgs.iter().rev().find(|m| m.role == "user").unwrap().content, "what is my cat called?");
+    assert!(!agent.msgs[0].content.contains("Biscuit"), "the system prompt no longer lists every memory");
+}
+
+#[test]
+fn recalled_memories_stay_within_the_budget() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "budget");
+    agent.cfg.num_ctx = 512;
+    // the whole memory section, markers included, has to fit: try budgets from too small to plenty
+    for share in [0.01, 0.02, 0.03, 0.05, 0.2] {
+        agent.cfg.memory_budget = share;
+        agent.send("cat biscuit vet", |_| {}).unwrap();
+        let sent = sent_user_message(&server);
+        let block = sent.strip_suffix("cat biscuit vet").unwrap_or(&sent);
+        let budget = (512.0 * share) as usize;
+        assert!(block.len().div_ceil(4) <= budget, "budget {budget}, sent {} tokens: {block}", block.len().div_ceil(4));
+    }
+    assert!(sent_user_message(&server).contains("Biscuit"), "a big enough budget fits it all");
+}
+
+#[test]
+fn with_no_memories_the_message_goes_as_typed() {
+    let server = MockServer::start();
+    let mut agent = agent(&server);
+    agent.memory = cortex_core::memory::Memory::open(&scratch_dir("recall_none"));
+    agent.msgs[0].content = cortex_core::agent::system_prompt(&agent.cfg, &agent.memory);
+    let mut recalled = false;
+    agent.send("hello", |e| if let Event::Recalled { .. } = e { recalled = true }).unwrap();
+    assert_eq!(sent_user_message(&server), "hello");
+    assert!(!recalled);
+    // nothing about memory for a user who has none: no recall tool, no memory line in the prompt
+    let req: serde_json::Value = ureq::get(&format!("{}/debug/last-request", server.url())).call().unwrap().into_json().unwrap();
+    let tools: Vec<&str> = req["tools"].as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+    assert!(!tools.contains(&"recall"), "{tools:?}");
+    assert!(!req["messages"][0]["content"].as_str().unwrap().contains("[Memory]"));
+    // and switching recall off sends it as typed too, memories or not
+    let mut agent = agent_with_pets(&server, "off");
+    agent.cfg.memory_budget = 0.0;
+    agent.send("what is my cat called?", |_| {}).unwrap();
+    assert_eq!(sent_user_message(&server), "what is my cat called?");
+}
+
+#[test]
+fn the_recall_tool_returns_notes_with_their_links() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "tool");
+    agent.cfg.memory_budget = 0.0; // only the tool, so its result is what we see
+    let (_, trace) = run_turn(&mut agent, "recall cat", Approval::Deny);
+    assert_eq!(trace[0], "tool recall", "no approval needed: it only reads");
+    let result = &trace[1];
+    assert!(result.contains("## Cat [[cat]]") && result.contains("Biscuit"), "{result}");
+    assert!(result.contains("links to: vet"), "{result}");
+}
+
+#[test]
+fn a_follow_up_question_still_brings_back_what_it_follows_up() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "follow_up");
+    agent.send("what is my cat called?", |_| {}).unwrap();
+    // nothing in this message matches a note; the conversation it continues does
+    agent.send("and how old is she?", |_| {}).unwrap();
+    let sent = sent_user_message(&server);
+    assert!(sent.contains("Biscuit") && sent.contains("Dr Lee"), "{sent}");
 }

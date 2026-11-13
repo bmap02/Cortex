@@ -209,3 +209,41 @@ fn apostrophes_dont_split_words_in_ids() {
     assert_eq!(added(mem.add(note("User's name is Ben", "The user's name is Ben.")).unwrap()).id, "users-name-is-ben");
     assert_eq!(added(mem.add(note("Don’t use tabs", "Prefers spaces.")).unwrap()).id, "dont-use-tabs", "curly apostrophes too");
 }
+
+/// A small memory: the cat note matches "cat", links to the vet (which doesn't), and the
+/// coffee note is unrelated.
+fn pets(name: &str) -> Memory {
+    let mem = Memory::open(&home(name));
+    added(mem.add(note("Cat", "The cat is called Biscuit. Her vet is [[Vet]]; see also [[Gone]].")).unwrap());
+    added(mem.add(note("Vet", "Dr Lee at the corner clinic.")).unwrap());
+    added(mem.add(note("Coffee", "Drinks black coffee in the morning.")).unwrap());
+    added(mem.add(note("Food", "Biscuit eats salmon; feeding notes for [[Cat]].")).unwrap());
+    mem
+}
+
+#[test]
+fn recall_brings_matching_notes_and_their_neighbours() {
+    let mem = pets("recall");
+    let ids: Vec<String> = mem.recall("what is my cat called?", 8, 1000).into_iter().map(|n| n.id).collect();
+    assert_eq!(ids[0], "cat", "the best match first: {ids:?}");
+    assert!(ids.contains(&"vet".to_string()), "one link away (the cat links to it): {ids:?}");
+    assert!(ids.contains(&"food".to_string()), "one link away (it links to the cat): {ids:?}");
+    assert!(!ids.contains(&"coffee".to_string()), "unrelated: {ids:?}");
+    // [[Gone]] points nowhere: skipped, nothing breaks
+    assert!(mem.recall("zebra", 8, 1000).is_empty());
+}
+
+#[test]
+fn recall_never_goes_over_its_budget() {
+    let mem = pets("budget");
+    let tokens = |notes: &[cortex_core::memory::Note]| notes.iter().map(cortex_core::memory::recall_tokens).sum::<usize>();
+    let all = mem.recall("cat biscuit", 8, 1000);
+    let full = tokens(&all);
+    assert!(all.len() >= 3);
+    for budget in [0, 5, full / 2, full - 1, full] {
+        let some = mem.recall("cat biscuit", 8, budget);
+        assert!(tokens(&some) <= budget, "budget {budget}: used {}", tokens(&some));
+    }
+    assert_eq!(mem.recall("cat biscuit", 8, full).len(), all.len());
+    assert!(mem.recall("cat biscuit", 8, 0).is_empty());
+}

@@ -27,6 +27,8 @@ def decide(messages):
         return ("text", para * 2 + "\n\nWide characters: 日本語テキスト and emoji 🚀🔥 count as two columns.\n" + "\n".join(f"- item {i}" for i in range(8)))
     if "huge" in text:
         return ("text", "\n".join(f"line {i}" for i in range(80)))
+    if text.startswith("recall "):
+        return ("tool", "recall", {"query": last["content"][len("recall "):].strip()})
     if "remember that " in text:
         at = text.index("remember that ") + len("remember that ")  # same offset in the original text
         return ("tool", "remember", {"fact": last["content"][at:].strip()})
@@ -39,6 +41,7 @@ def decide(messages):
         return ("tool", "calculator", {"expression": "1234 * 5678"})
     return ("text", "Hi! I'm a mock model running locally.")
 
+LAST_CHAT = {}  # the last chat request, for tests to see exactly what the model was sent
 PULLED = []  # models "downloaded" through /api/pull or created through /api/create
 BLOBS = set()  # sha256 digests uploaded to /api/blobs
 GGUF = b"GGUF" + bytes(range(256)) * 4096  # a ~1 MB stand-in for a model file
@@ -65,6 +68,8 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/tags":
             self._json({"models": [{"name": "mock:7b", "size": 4.1e9, "details": {"parameter_size": "7B", "quantization_level": "Q4_K_M"}}]
                        + [{"name": n, "size": 1.9e9, "details": {}} for n in PULLED]})
+        elif self.path == "/debug/last-request":
+            self._json(LAST_CHAT)
         elif self.path == "/v1/models":
             self._json({"data": [{"id": "mock-7b"}]})
         elif self.path.startswith("/api/models/") and "/tree/main" in self.path:
@@ -99,6 +104,8 @@ class H(BaseHTTPRequestHandler):
             self.send_response(201); self.send_header("Content-Length", "0"); self.end_headers()
             return
         body = json.loads(raw)
+        if self.path in ("/api/chat", "/v1/chat/completions"):
+            LAST_CHAT.clear(); LAST_CHAT.update(body)
         if self.path == "/api/create":
             missing = [d for d in body.get("files", {}).values() if d.split(":")[-1] not in BLOBS]
             if missing or not body.get("files"):

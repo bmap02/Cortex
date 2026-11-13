@@ -9,6 +9,7 @@
 use crate::backend::{Backend, BackendError, Msg, Usage};
 use crate::cancel::CancelHandle;
 use crate::config::{self, Config};
+use crate::memory::{self, Memory};
 use crate::tools;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -128,6 +129,10 @@ pub struct Agent {
     pub total_completion: usize,
     /// Stops the turn in progress; the front-end sets it (Ctrl-C, a Stop button).
     pub cancel: CancelHandle,
+    /// Long-term memory: recalled into each message, and what `remember` and `recall` use.
+    pub memory: Memory,
+    /// The memories recalled for the turn in progress, as sent ahead of its message.
+    turn_memory_block: Option<String>,
 }
 
 /// What happens during a turn, in order. The last event is always [`Event::Done`] or [`Event::Error`].
@@ -145,6 +150,8 @@ pub enum Event {
     ToolStarted { name: String, description: String },
     /// A tool call identical to one in the previous step: not run again.
     ToolSkipped { name: String, description: String },
+    /// Notes from long-term memory sent with this message (their titles).
+    Recalled { notes: Vec<String> },
     /// A tool call needs the user's OK before it runs.
     ApprovalRequest(ApprovalRequest),
     /// The tool call that last started has finished with this result (what the model sees).
@@ -206,7 +213,9 @@ impl ApprovalRequest {
     pub fn answer(self, a: Approval) { let _ = self.reply.send(a); }
 }
 
-pub fn system_prompt(cfg: &Config) -> String {
+/// The system prompt. `memory` decides whether it explains recalled memories: a user without any
+/// gets the same prompt as before memory existed.
+pub fn system_prompt(cfg: &Config, memory: &Memory) -> String {
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
     let mut s = format!(
 "You are Cortex, a helpful assistant running entirely on the user's own machine. Nothing leaves this computer.
@@ -223,23 +232,26 @@ You can call tools to read and edit files, search code, run shell commands and P
     let folders: Vec<String> = ["Desktop", "Documents", "Downloads"].iter()
         .filter_map(|n| config::user_folder(n).map(|p| format!("{n} = {}", p.display()))).collect();
     if !folders.is_empty() { s += &format!("\nUser folders: {}.", folders.join(", ")); }
+    if !memory.is_empty() {
+        s += "\n- Notes from your long-term memory may come before the user's message, between [Memory] and [End of memory]. Use what helps and ignore the rest; `recall` searches memory for more.";
+    }
     if let Ok(soul) = std::fs::read_to_string(config::soul_path())
         && !soul.trim().is_empty() { s += &format!("\n\n# Persona\n{}", soul.trim()); }
-    // every note, until recall brings in just the relevant ones (ticket 08)
-    let notes = crate::memory::Memory::open(&config::home()).notes();
-    if !notes.is_empty() {
-        let lines: Vec<String> = notes.iter().map(|n| format!("- {}", crate::memory::one_line(&n.body))).collect();
-        s += &format!("\n\n# What you remember about the user\n{}", lines.join("\n"));
-    }
     s
+}
+
+/// The memories recalled for a message, as they go ahead of it.
+fn memory_block(notes: &[memory::Note]) -> String {
+    format!("[Memory]\n{}\n[End of memory]\n\n", memory::render_recalled(notes))
 }
 
 impl Agent {
     pub fn new(cfg: Config) -> Agent {
         let backend = Backend::new(&cfg);
+        let memory = Memory::open(&config::home());
         Agent {
             model: cfg.model.clone(),
-            msgs: vec![Msg::new("system", system_prompt(&cfg))],
+            msgs: vec![Msg::new("system", system_prompt(&cfg, &memory))],
             session_id: fresh_session_id(),
             created: now(),
             approve_all: cfg.auto_approve,
@@ -248,20 +260,22 @@ impl Agent {
             total_prompt: 0,
             total_completion: 0,
             cancel: CancelHandle::new(),
+            memory,
+            turn_memory_block: None,
             backend,
             cfg,
         }
     }
 
     pub fn reset(&mut self) {
-        self.msgs = vec![Msg::new("system", system_prompt(&self.cfg))];
+        self.msgs = vec![Msg::new("system", system_prompt(&self.cfg, &self.memory))];
         self.session_id = fresh_session_id();
         self.created = now();
         self.last = Usage::default();
     }
 
     pub fn resume(&mut self, s: Session) {
-        self.msgs = vec![Msg::new("system", system_prompt(&self.cfg))];
+        self.msgs = vec![Msg::new("system", system_prompt(&self.cfg, &self.memory))];
         self.msgs.extend(s.messages);
         self.session_id = s.id;
         self.created = s.created;
@@ -272,6 +286,29 @@ impl Agent {
         let s = Session { id: self.session_id.clone(), model: self.model.clone(), created: self.created, messages: self.msgs[1..].to_vec() };
         let _ = std::fs::create_dir_all(config::sessions_dir());
         let _ = std::fs::write(config::sessions_dir().join(format!("{}.json", s.id)), serde_json::to_string_pretty(&s).unwrap_or_default());
+    }
+
+    /// The notes relevant to a new message, within the memory budget (the markers around them
+    /// included). They're looked up by the message and the two before it, so a follow-up like
+    /// "and when is her appointment?" still finds what it follows up.
+    fn recall_for(&self, text: &str) -> Vec<memory::Note> {
+        let budget = self.cfg.memory_tokens().saturating_sub(memory_block(&[]).len().div_ceil(4));
+        if budget == 0 { return vec![]; }
+        let mut query: Vec<&str> = self.msgs.iter().rev().filter(|m| m.role == "user").take(2).map(|m| m.content.as_str()).collect();
+        query.push(text);
+        self.memory.recall(&query.join("\n"), 8, budget)
+    }
+
+    /// The conversation as sent to the model: the recalled memories go ahead of the latest user
+    /// message in this request only. They aren't kept in the conversation, so saved sessions and
+    /// /undo see what the user typed, and the system prompt stays the same from turn to turn
+    /// (rewriting it would make the server re-read the whole conversation every time).
+    fn request(&self) -> Vec<Msg> {
+        let mut msgs = self.msgs.clone();
+        if let (Some(block), Some(i)) = (&self.turn_memory_block, msgs.iter().rposition(|m| m.role == "user")) {
+            msgs[i].content = format!("{block}{}", msgs[i].content);
+        }
+        msgs
     }
 
     /// Rough token estimate (chars / 4) when the server hasn't told us.
@@ -311,6 +348,9 @@ impl Agent {
             return Err(e);
         }
         self.cancel.reset(); // a stop meant for an earlier turn doesn't carry over
+        let notes = self.recall_for(text);
+        self.turn_memory_block = (!notes.is_empty()).then(|| memory_block(&notes));
+        if !notes.is_empty() { on_event(Event::Recalled { notes: notes.into_iter().map(|n| n.title).collect() }); }
         self.msgs.push(Msg::new("user", text));
         let (tx, rx) = mpsc::channel();
         std::thread::scope(|scope| {
@@ -341,13 +381,16 @@ impl Agent {
                 emit(Event::Compressing);
                 if let Err(e) = self.compress() { self.msgs.pop_if_user(); return Err(e); }
             }
-            let schemas = if self.tools_supported { tools::schemas(&self.cfg) } else { vec![] };
+            let mut schemas = if self.tools_supported { tools::schemas(&self.cfg) } else { vec![] };
+            // nothing to recall without memories: don't offer the tool
+            if self.memory.is_empty() { schemas.retain(|s| s["function"]["name"] != "recall"); }
             let mut on_text = |t: &str| emit(Event::Text(t.to_string()));
-            let result = match self.backend.chat(&self.cfg, &self.model, &self.msgs, &schemas, &self.cancel, &mut on_text) {
+            let request = self.request();
+            let result = match self.backend.chat(&self.cfg, &self.model, &request, &schemas, &self.cancel, &mut on_text) {
                 Err(BackendError::ToolsUnsupported(m)) if self.tools_supported => {
                     self.tools_supported = false;
                     emit(Event::PlainChatFallback(m));
-                    self.backend.chat(&self.cfg, &self.model, &self.msgs, &[], &self.cancel, &mut on_text)
+                    self.backend.chat(&self.cfg, &self.model, &request, &[], &self.cancel, &mut on_text)
                 }
                 other => other,
             };
@@ -406,7 +449,7 @@ impl Agent {
                         declined = true;
                         "The user declined this action. Do not retry it or try a workaround; wait for their instructions.".to_string()
                     }
-                    Some(_) => tools::execute(&call.name, &call.args, &tools::ToolContext { cfg: &self.cfg, cancel: &self.cancel, session_id: &self.session_id }),
+                    Some(_) => tools::execute(&call.name, &call.args, &tools::ToolContext { cfg: &self.cfg, cancel: &self.cancel, session_id: &self.session_id, memory: &self.memory }),
                 };
                 emit(Event::ToolFinished { result: result.clone() });
                 self.msgs.push(Msg::tool_result(call, result));
