@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_OUTPUT: usize = 12_000;
@@ -335,11 +336,8 @@ fn run_shell(cmd: &str, timeout: u64, cancel: &CancelHandle) -> Result<String, S
 
 fn run_process(c: &mut Command, timeout: u64, cancel: &CancelHandle) -> Result<String, String> {
     let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
-    let mut so = child.stdout.take().unwrap();
-    let mut se = child.stderr.take().unwrap();
-    // read bytes, not String: Windows tools often print in the console code page, not UTF-8
-    let t1 = std::thread::spawn(move || { let mut b = vec![]; let _ = so.read_to_end(&mut b); String::from_utf8_lossy(&b).replace("\r\n", "\n") });
-    let t2 = std::thread::spawn(move || { let mut b = vec![]; let _ = se.read_to_end(&mut b); String::from_utf8_lossy(&b).replace("\r\n", "\n") });
+    let (out, t1) = drain(child.stdout.take().unwrap());
+    let (err, t2) = drain(child.stderr.take().unwrap());
     let start = Instant::now();
     let status = loop {
         if let Some(st) = child.try_wait().map_err(|e| e.to_string())? { break Some(st); }
@@ -350,7 +348,14 @@ fn run_process(c: &mut Command, timeout: u64, cancel: &CancelHandle) -> Result<S
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let (out, err) = (t1.join().unwrap_or_default(), t2.join().unwrap_or_default());
+    // A program the command started (a server, `sleep 30 &`) can keep the pipes open after the
+    // shell is gone, killed or not: take what came out so far instead of waiting for it.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !(t1.is_finished() && t2.is_finished()) && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(20)); }
+    let still_running = !(t1.is_finished() && t2.is_finished());
+    // bytes, not String: Windows tools often print in the console code page, not UTF-8
+    let text = |b: &Mutex<Vec<u8>>| String::from_utf8_lossy(&b.lock().unwrap_or_else(|e| e.into_inner())).replace("\r\n", "\n");
+    let (out, err) = (text(&out), text(&err));
     let mut s = String::new();
     if !out.is_empty() { s += &out; }
     if !err.is_empty() { s += &format!("[stderr]\n{err}"); }
@@ -359,7 +364,23 @@ fn run_process(c: &mut Command, timeout: u64, cancel: &CancelHandle) -> Result<S
         Some(st) if !st.success() => s += &format!("\n[exit code {}]", st.code().unwrap_or(-1)),
         _ => {}
     }
+    if still_running { s += "\n[a program it started is still running]"; }
     Ok(if s.trim().is_empty() { "(no output)".into() } else { s })
+}
+
+/// Read a pipe to its end on its own thread, into a buffer that can be taken at any time.
+/// Past 1 MB it keeps reading (so the program writing never blocks) but stops keeping.
+fn drain(mut pipe: impl Read + Send + 'static) -> (Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
+    let buf = Arc::new(Mutex::new(vec![]));
+    let kept = buf.clone();
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+            let mut b = kept.lock().unwrap_or_else(|e| e.into_inner());
+            if b.len() < 1_000_000 { b.extend_from_slice(&chunk[..n]); }
+        }
+    });
+    (buf, reader)
 }
 
 fn run_python(a: &Value, cancel: &CancelHandle) -> Result<String, String> {
@@ -513,6 +534,15 @@ mod tests {
         assert!(run_shell("echo hi", 5, &CancelHandle::new()).unwrap().contains("hi"));
         let sleep = if cfg!(windows) { "Start-Sleep -Seconds 3" } else { "sleep 3" };
         assert!(run_shell(sleep, 1, &CancelHandle::new()).unwrap().contains("killed"));
+    }
+    #[test]
+    fn a_killed_command_returns_even_if_a_program_it_started_keeps_running() {
+        // the shell's child holds the output pipe open after the shell itself is killed
+        let child = if cfg!(windows) { "ping -n 30 127.0.0.1" } else { "sleep 30 | cat" };
+        let start = Instant::now();
+        // killed after 3 s: Windows PowerShell takes a second or so to start the child
+        assert!(run_shell(child, 3, &CancelHandle::new()).unwrap().contains("killed"));
+        assert!(start.elapsed() < Duration::from_secs(10), "took {:?}", start.elapsed());
     }
     #[test]
     fn home_expansion() {
