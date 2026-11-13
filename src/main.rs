@@ -200,6 +200,7 @@ const SLASH: &[(&str, &str)] = &[
     ("/usage", "token usage this session"),
     ("/context", "show or set the context window: /context 32k"),
     ("/memory", "list long-term memory (notes in ~/.cortex/memory)"),
+    ("/consolidate", "review suggested memories, and tidy memory: merges, links, dead links"),
     ("/forget", "delete all long-term memory"),
     ("/sessions", "list saved sessions · /sessions clear · /sessions delete <id>"),
     ("/resume", "load a session: /resume last, or /resume <id>"),
@@ -357,7 +358,11 @@ fn chat(cfg: Config, resume: Option<String>) {
     let mut agent = new_agent(cfg);
     if let Some(id) = resume {
         match agent::load_session(&id) {
-            Some(s) => { println!("{}", ui::muted(&format!("resumed session {} ({} messages)", s.id, s.messages.len()))); agent.resume(s) }
+            Some(s) => {
+                println!("{}", ui::muted(&format!("resumed session {} ({} messages)", s.id, s.messages.len())));
+                agent.resume(s);
+                if let Some(h) = memory_cmd::pending_hint(&agent) { println!("{}", ui::faint(&h)); }
+            }
             None => println!("{}", ui::error("no matching session; starting fresh")),
         }
     }
@@ -402,12 +407,14 @@ fn chat(cfg: Config, resume: Option<String>) {
     }
     let _ = rl.save_history(&config::history_path());
     agent.save();
-    write_session_note(&mut agent);
+    finish_session(&mut agent);
     println!("{}", ui::faint(&format!("session saved: {}  (resume with: cortex -r {})", agent.session_id, agent.session_id)));
 }
 
-/// The session is ending: save its summary to long-term memory, if it's long enough to need one.
-fn write_session_note(agent: &mut Agent) {
+/// The session is ending: review the memories it suggested, then save its summary to long-term
+/// memory (after the review, so it links to what was kept), if it's long enough to need one.
+fn finish_session(agent: &mut Agent) {
+    memory_cmd::review_in_terminal(agent, false);
     if !agent.wants_session_note() { return; }
     println!("{}", ui::faint("writing a session note… (Ctrl+C skips it)"));
     match agent.end_session() {
@@ -428,7 +435,7 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
         }
         "/new" | "/reset" | "/clear" => {
             agent.save();
-            write_session_note(agent);
+            finish_session(agent);
             agent.reset();
             // clear the screen and its scrollback, then start over from the banner
             if ui::color_on() { print!("\x1b[2J\x1b[3J\x1b[H"); }
@@ -462,6 +469,7 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
         "/usage" => println!("  {}\n  {}",
             ui::muted(&format!("this session: {} prompt + {} completion tokens", agent.total_prompt, agent.total_completion)),
             ui::muted(&format!("context: ~{} / {} tokens · {} messages", agent.ctx_used(), agent.cfg.num_ctx, agent.msgs.len()))),
+        "/consolidate" => memory_cmd::review_in_terminal(agent, true),
         "/memory" => memory_cmd::list(&cortex_core::memory::Memory::open(&config::home())),
         "/forget" => {
             memory_cmd::clear(&cortex_core::memory::Memory::open(&config::home()), false);
@@ -489,8 +497,9 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
                         println!("{}", ui::faint(&format!("  started with {}; continuing with {} (/model {} to switch back)", s.model, agent.model, s.model)));
                     }
                     agent.save();
-                    write_session_note(agent);
+                    finish_session(agent);
                     agent.resume(s);
+                    if let Some(h) = memory_cmd::pending_hint(agent) { println!("{}", ui::faint(&h)); }
                 }
                 None => println!("{}", ui::error("no matching session (see /sessions)")),
             }
@@ -522,10 +531,14 @@ fn run_once(cfg: Config, prompt: String, quiet: bool, no_tools: bool) -> i32 {
     if !std::io::stdin().is_terminal() && !agent.approve_all {
         agent.cfg.disabled_tools.extend(tools::all().iter().filter(|t| t.needs_approval).map(|t| t.name.to_string()));
     }
-    if quiet {
-        return match turn::send(&mut agent, &prompt, true) { Ok(_) => { println!(); 0 } Err(e) => { eprintln!("{e}"); 1 } };
-    }
-    match turn::send(&mut agent, &prompt, false) { Ok(_) => 0, Err(e) => { eprintln!("{}", ui::error(&format!("✗ {e}"))); 1 } }
+    let code = if quiet {
+        match turn::send(&mut agent, &prompt, true) { Ok(_) => { println!(); 0 } Err(e) => { eprintln!("{e}"); 1 } }
+    } else {
+        match turn::send(&mut agent, &prompt, false) { Ok(_) => 0, Err(e) => { eprintln!("{}", ui::error(&format!("✗ {e}"))); 1 } }
+    };
+    // nobody can review here; on stderr, so a piped answer stays clean
+    if let Some(h) = memory_cmd::pending_hint(&agent) { eprintln!("{}", ui::faint(&h)); }
+    code
 }
 
 // ---------------------------------------------------------------- setup & management

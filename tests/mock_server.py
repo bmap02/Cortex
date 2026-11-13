@@ -5,6 +5,7 @@ Scripted behaviour: if the last message is from the user, ask for a tool call
 tool result comes back, stream a final answer that quotes the result. A prompt
 containing "loop" repeats the same calculator call until Cortex refuses to rerun it.
 "write to <path>" asks to write that file; "slow" streams a long answer slowly (for stopping).
+"I learned that <fact>[, related to <note>]" proposes a memory with suggest_memory.
 Asked to summarize the conversation (a request without tools), it lists the user's messages.
 /api/pull streams download progress and adds the model to /api/tags.
 For imports: /api/models/<repo>/tree/main lists a Hugging Face repo's files, /files/model.gguf is a
@@ -23,6 +24,11 @@ def decide(messages):
             return ("tool", "calculator", {"expression": "1234 * 5678"})
         return ("text", f"Done. The tool said: {last['content'].strip()}")
     text = last["content"].lower()
+    if "i learned that " in text:
+        # "I learned that <fact>[, related to <note>]": propose a memory for review
+        fact = last["content"][text.index("i learned that ") + len("i learned that "):].strip()
+        fact, _, related = fact.partition(", related to ")
+        return ("tool", "suggest_memory", {"fact": fact.strip(), "related": [related.strip()] if related else []})
     if "long" in text:
         para = "This is a deliberately long line that wraps across the terminal width so the row counter has to account for soft wrapping correctly. "
         return ("text", para * 2 + "\n\nWide characters: 日本語テキスト and emoji 🚀🔥 count as two columns.\n" + "\n".join(f"- item {i}" for i in range(8)))

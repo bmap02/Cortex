@@ -268,3 +268,143 @@ fn put_writes_a_note_at_its_id_and_rewrites_it_keeping_when_it_was_created() {
     assert!(files.iter().all(|f| f == "session-20261113-090000.md" || f == ".index.json"), "no temporary files left: {files:?}");
     assert!(mem.put("session-x", session("  ")).is_err(), "a note needs some text");
 }
+
+// ---------------------------------------------------------------- consolidation
+
+fn add(mem: &Memory, title: &str, body: &str) -> cortex_core::memory::Note { added(mem.add(note(title, body)).unwrap()) }
+
+#[test]
+fn consolidation_proposes_merging_near_duplicates_and_changes_nothing_until_applied() {
+    use cortex_core::memory::Proposal;
+    let mem = Memory::open(&home("merge"));
+    add(&mem, "Dark mode", "The user prefers dark mode in every editor.");
+    add(&mem, "Dark theme", "The user prefers dark mode in every editor and terminal.");
+    add(&mem, "Rust", "Works mostly in Rust.");
+    let project = add(&mem, "Project", "Cortex follows [[Dark mode]].");
+
+    let merge = mem.consolidation().into_iter().find(|p| matches!(p, Proposal::Merge { .. })).expect("a merge");
+    let Proposal::Merge { keep, remove, body } = &merge else { unreachable!() };
+    assert_eq!((keep.as_str(), remove.as_str()), ("dark-theme", "dark-mode"), "keeps the fuller note");
+    assert!(body.contains("and terminal") && body.contains("in every editor."), "{body}");
+    assert_eq!(mem.notes().len(), 4, "only a proposal so far");
+
+    let kept = mem.apply(&merge, None).unwrap();
+    assert_eq!(&kept.body, body, "the kept note, as merged");
+    assert!(mem.find("dark-mode").is_none());
+    let project = mem.find(&project.id).unwrap();
+    assert!(project.body.contains("[[dark-theme]]"), "links to the removed note now point at the kept one: {}", project.body);
+    assert!(mem.links(&project).outgoing.iter().all(|l| l.note.is_some()));
+    assert!(!mem.consolidation().iter().any(|p| matches!(p, Proposal::Merge { .. })), "nothing left to merge");
+}
+
+#[test]
+fn consolidation_proposes_links_between_related_notes() {
+    use cortex_core::memory::Proposal;
+    let mem = Memory::open(&home("links"));
+    add(&mem, "Cat", "The cat Biscuit sleeps on the piano all day.");
+    add(&mem, "Piano", "The piano in the living room is a Yamaha the cat sleeps on.");
+    add(&mem, "Coffee", "Black coffee every morning.");
+
+    let links: Vec<Proposal> = mem.consolidation().into_iter().filter(|p| matches!(p, Proposal::Link { .. })).collect();
+    assert_eq!(links.len(), 1, "{links:?}");
+    let Proposal::Link { from, to } = &links[0] else { unreachable!() };
+    let mut pair = [from.as_str(), to.as_str()];
+    pair.sort();
+    assert_eq!(pair, ["cat", "piano"]);
+
+    mem.apply(&links[0], None).unwrap();
+    let from_note = mem.find(from).unwrap();
+    assert!(mem.links(&from_note).outgoing.iter().any(|l| l.note.as_ref().is_some_and(|n| &n.id == to)), "{}", from_note.body);
+    assert!(!mem.consolidation().iter().any(|p| matches!(p, Proposal::Link { .. })), "already linked now");
+}
+
+#[test]
+fn consolidation_offers_to_fix_or_remove_dead_links() {
+    use cortex_core::memory::Proposal;
+    let mem = Memory::open(&home("dead"));
+    add(&mem, "Vet", "Dr Lee at the corner clinic.");
+    let cat = add(&mem, "Cat", "Biscuit sees the [[Old vet]] about [[Zzyzx]].");
+
+    let fixes: Vec<Proposal> = mem.consolidation().into_iter().filter(|p| matches!(p, Proposal::FixLink { .. })).collect();
+    assert_eq!(fixes, vec![
+        Proposal::FixLink { note: "cat".into(), target: "Old vet".into(), to: Some("vet".into()) },
+        Proposal::FixLink { note: "cat".into(), target: "Zzyzx".into(), to: None },
+    ]);
+    for f in &fixes { mem.apply(f, None).unwrap(); }
+    let body = mem.find(&cat.id).unwrap().body;
+    assert_eq!(body, "Biscuit sees the [[vet]] about Zzyzx.", "a link with no match becomes plain text");
+    // an edit picks another target, or (empty) removes the link
+    assert_eq!(fixes[0].with_text(""), Proposal::FixLink { note: "cat".into(), target: "Old vet".into(), to: None });
+    assert_eq!(fixes[1].with_text("vet"), Proposal::FixLink { note: "cat".into(), target: "Zzyzx".into(), to: Some("vet".into()) });
+}
+
+#[test]
+fn consolidation_keeps_hand_written_frontmatter_and_leaves_session_notes_alone() {
+    use cortex_core::memory::{NewNote, Proposal};
+    let h = home("frontmatter");
+    let mem = Memory::open(&h);
+    std::fs::create_dir_all(mem.dir()).unwrap();
+    std::fs::write(mem.dir().join("cat.md"), "---\ntitle: Cat\ntags: pets\n---\nBiscuit sees the [[Old vet]].\n").unwrap();
+    add(&mem, "Vet", "Dr Lee at the corner clinic, the old vet.");
+    let summary = "Summary: the user asked about the cat Biscuit and the old vet Dr Lee at the corner clinic.";
+    mem.put("session-1", NewNote { title: "Session: cat".into(), body: summary.into(), kind: "session".into(), source: Some("1".into()) }).unwrap();
+
+    let props = mem.consolidation();
+    assert!(!props.iter().any(|p| matches!(p, Proposal::Merge { remove, keep, .. } | Proposal::Link { from: remove, to: keep } if remove.starts_with("session-") || keep.starts_with("session-"))),
+        "session notes are summaries, not merged or linked: {props:?}");
+    let fix = props.iter().find(|p| matches!(p, Proposal::FixLink { .. })).expect("a fix");
+    mem.apply(fix, None).unwrap();
+    let text = std::fs::read_to_string(mem.dir().join("cat.md")).unwrap();
+    assert!(text.contains("tags: pets") && text.contains("[[vet]]"), "{text}");
+}
+
+#[test]
+fn consolidation_proposes_at_most_ten_changes_at_a_time() {
+    let mem = Memory::open(&home("cap"));
+    for i in 0..15 { add(&mem, &format!("Note {i}"), &format!("Links to [[Missing {i}]].")); }
+    assert_eq!(mem.consolidation().len(), 10);
+}
+
+#[test]
+fn three_near_duplicates_are_merged_one_pair_per_review_so_every_proposal_still_applies() {
+    use cortex_core::memory::Proposal;
+    let mem = Memory::open(&home("merge3"));
+    add(&mem, "Editor theme", "The user prefers dark mode in every editor.");
+    add(&mem, "Editor colours", "The user prefers dark mode in every editor, always.");
+    add(&mem, "Editor look", "The user prefers dark mode in every single editor.");
+    let merges: Vec<Proposal> = mem.consolidation().into_iter().filter(|p| matches!(p, Proposal::Merge { .. })).collect();
+    assert_eq!(merges.len(), 1, "{merges:?}");
+    mem.apply(&merges[0], None).unwrap();
+    let next: Vec<Proposal> = mem.consolidation().into_iter().filter(|p| matches!(p, Proposal::Merge { .. })).collect();
+    assert_eq!(next.len(), 1, "the third note's turn comes next time: {next:?}");
+    mem.apply(&next[0], None).unwrap();
+    assert_eq!(mem.notes().len(), 1);
+}
+
+#[test]
+fn a_merge_never_leaves_the_kept_note_linking_to_itself_or_a_link_twice() {
+    use cortex_core::memory::{Candidate, Proposal};
+    let mem = Memory::open(&home("merge_self"));
+    let keep = add(&mem, "Dark theme", "The user prefers dark mode in every editor and terminal. Same as [[Dark mode]].");
+    add(&mem, "Dark mode", "The user prefers dark mode in every editor.");
+    let merge = Proposal::Merge { keep: keep.id.clone(), remove: "dark-mode".into(), body: keep.body.clone() };
+    let kept = mem.apply(&merge, None).unwrap();
+    assert!(!kept.body.contains("[["), "a link to the merged-away note isn't turned into a link to itself: {}", kept.body);
+    // and related notes named twice are linked once
+    let new = Proposal::New(Candidate { body: "Uses a dark terminal.".into(), kind: "fact".into(), related: vec!["Dark theme".into(), "Rust".into(), "dark-theme".into()] });
+    assert_eq!(mem.apply(&new, None).unwrap().body.matches("[[dark-theme]]").count(), 1);
+}
+
+#[test]
+fn many_dead_links_dont_crowd_out_merges_and_links() {
+    use cortex_core::memory::Proposal;
+    let mem = Memory::open(&home("cap_fair"));
+    for i in 0..12 { add(&mem, &format!("Broken {i}"), &format!("Points at [[Qqq{i}]] zz{i}.")); }
+    add(&mem, "Dark mode", "The user prefers dark mode in every editor.");
+    add(&mem, "Dark theme", "The user prefers dark mode in every editor and terminal.");
+    add(&mem, "Cat", "The cat Biscuit sleeps on the piano all day.");
+    add(&mem, "Piano", "The piano in the living room is a Yamaha the cat sleeps on.");
+    let props = mem.consolidation();
+    assert_eq!(props.len(), 10);
+    assert!(props.iter().any(|p| matches!(p, Proposal::Merge { .. })) && props.iter().any(|p| matches!(p, Proposal::Link { .. })), "{props:?}");
+}

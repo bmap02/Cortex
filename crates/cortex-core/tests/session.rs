@@ -431,3 +431,128 @@ fn compressing_a_single_exchange_writes_no_note() {
     agent.compress().unwrap();
     assert!(session_notes(&agent).is_empty());
 }
+
+// ---------------------------------------------------------------- candidate memories and review
+
+#[test]
+fn suggested_memories_are_held_for_review_not_saved() {
+    use cortex_core::memory::Proposal;
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "cand_held");
+    let mut collected = vec![];
+    let mut approvals = 0;
+    agent.send("I learned that the cat sleeps on the piano, related to Cat", |e| match e {
+        Event::MemoryCandidate(c) => collected.push(c),
+        Event::ApprovalRequest(_) => approvals += 1,
+        _ => {}
+    }).unwrap();
+    assert_eq!(collected.len(), 1, "front-ends are told about the candidate");
+    assert_eq!((collected[0].body.as_str(), collected[0].related.clone()), ("the cat sleeps on the piano", vec!["Cat".to_string()]));
+    assert_eq!(approvals, 0, "nothing is saved yet, so nothing to approve");
+    assert!(!agent.memory.notes().iter().any(|n| n.body.contains("piano")), "nothing saved before review");
+    assert_eq!(agent.to_review(false), vec![Proposal::New(collected[0].clone())]);
+
+    // kept with the session: resuming it brings the candidate back
+    let mut later = self::agent(&server);
+    later.memory = cortex_core::memory::Memory::open(agent.memory.dir().parent().unwrap());
+    later.resume(cortex_core::agent::load_session(&agent.session_id).unwrap());
+    assert_eq!(later.to_review(false), vec![Proposal::New(collected[0].clone())]);
+}
+
+#[test]
+fn a_candidate_already_in_memory_or_already_suggested_is_not_added_again() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "cand_dupes");
+    let (_, trace) = run_turn(&mut agent, "I learned that Drinks black coffee in the morning.", Approval::Deny);
+    assert!(trace[1].contains("already in memory") && trace[1].contains("[[coffee]]"), "{}", trace[1]);
+    run_turn(&mut agent, "I learned that the vet is closed on Mondays", Approval::Deny).0.unwrap();
+    let (_, trace) = run_turn(&mut agent, "I learned that The vet is closed on Mondays", Approval::Deny);
+    assert!(trace[1].contains("already suggested"), "{}", trace[1]);
+    assert_eq!(agent.to_review(false).len(), 1);
+}
+
+#[test]
+fn an_approved_candidate_becomes_a_linked_note_that_the_session_note_links() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "cand_approve");
+    agent.cfg.memory_budget = 0.0; // so the session note can only link what was approved
+    agent.send("I learned that the cat sleeps on the piano, related to Cat", |_| {}).unwrap();
+    agent.send("hello", |_| {}).unwrap();
+    let items = agent.to_review(false);
+    agent.accept(&items[0], None).unwrap();
+
+    let note = agent.memory.notes().into_iter().find(|n| n.body.contains("piano")).expect("saved once approved");
+    assert_eq!((note.kind.as_str(), note.source.as_deref()), ("fact", Some(agent.session_id.as_str())));
+    assert!(note.body.contains("[[cat]]"), "linked to the note it relates to: {}", note.body);
+    assert!(agent.to_review(false).is_empty(), "reviewed");
+    let session = agent.end_session().unwrap().expect("a session note");
+    assert!(session.body.contains(&format!("[[{}]]", note.id)), "{}", session.body);
+}
+
+#[test]
+fn an_edited_candidate_is_saved_as_edited_and_a_rejected_one_is_dropped_for_good() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "cand_edit");
+    agent.send("I learned that the cat sleeps on the piano", |_| {}).unwrap();
+    agent.send("I learned that the vet is closed on Mondays", |_| {}).unwrap();
+    let items = agent.to_review(false);
+    agent.accept(&items[0], Some("The cat sleeps on the grand piano.")).unwrap();
+    agent.reject(&items[1]);
+
+    let bodies: Vec<String> = agent.memory.notes().into_iter().map(|n| n.body).collect();
+    assert!(bodies.iter().any(|b| b == "The cat sleeps on the grand piano."), "{bodies:?}");
+    assert!(!bodies.iter().any(|b| b.contains("Mondays") || b == "the cat sleeps on the piano"), "{bodies:?}");
+    // the review is saved with the session too
+    let mut later = self::agent(&server);
+    later.memory = cortex_core::memory::Memory::open(agent.memory.dir().parent().unwrap());
+    later.resume(cortex_core::agent::load_session(&agent.session_id).unwrap());
+    assert!(later.to_review(false).is_empty());
+}
+
+#[test]
+fn consolidating_reviews_the_candidates_and_the_whole_memory() {
+    use cortex_core::memory::{NewNote, Proposal};
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "cand_consolidate");
+    agent.memory.add(NewNote { title: "Old".into(), body: "Saw [[Gone]] once.".into(), kind: "fact".into(), source: None }).unwrap();
+    agent.send("I learned that the vet is closed on Mondays", |_| {}).unwrap();
+    let items = agent.to_review(true);
+    assert!(matches!(items[0], Proposal::New(_)), "the session's candidates first: {items:?}");
+    assert!(items.iter().any(|p| matches!(p, Proposal::FixLink { target, .. } if target == "Gone")), "{items:?}");
+    assert_eq!(agent.to_review(false).len(), 1, "at session end, only the candidates");
+}
+
+#[test]
+fn a_saved_candidate_with_links_is_still_recognised_when_suggested_again() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "cand_again");
+    agent.send("I learned that the cat sleeps on the piano, related to Cat", |_| {}).unwrap();
+    let items = agent.to_review(false);
+    agent.accept(&items[0], None).unwrap();
+    let (_, trace) = run_turn(&mut agent, "I learned that the cat sleeps on the piano, related to Cat", Approval::Deny);
+    assert!(trace[1].contains("already in memory"), "{}", trace[1]);
+    assert!(agent.to_review(false).is_empty());
+}
+
+#[test]
+fn undoing_a_turn_drops_the_memories_it_suggested() {
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "cand_undo");
+    agent.send("I learned that the vet is closed on Mondays", |_| {}).unwrap();
+    agent.send("I learned that the cat sleeps on the piano", |_| {}).unwrap();
+    agent.undo();
+    let left: Vec<String> = agent.to_review(false).iter().map(|p| p.text()).collect();
+    assert_eq!(left, ["the vet is closed on Mondays"]);
+}
+
+#[test]
+fn reviewed_tidy_ups_are_carried_out_through_the_session() {
+    use cortex_core::memory::{NewNote, Proposal};
+    let server = MockServer::start();
+    let mut agent = agent_with_pets(&server, "cand_fix");
+    let old = agent.memory.add(NewNote { title: "Old".into(), body: "Saw [[Gone]] once.".into(), kind: "fact".into(), source: None }).unwrap();
+    let old = match old { cortex_core::memory::Added::Created(n) | cortex_core::memory::Added::Exists(n) => n };
+    let fix = agent.to_review(true).into_iter().find(|p| matches!(p, Proposal::FixLink { .. })).unwrap();
+    agent.accept(&fix, Some("cat")).unwrap();
+    assert_eq!(agent.memory.find(&old.id).unwrap().body, "Saw [[cat]] once.");
+}

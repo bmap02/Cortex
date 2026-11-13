@@ -5,7 +5,7 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -60,6 +60,54 @@ pub struct Deleted {
 pub struct Hit {
     pub note: Note,
     pub score: f64,
+}
+
+/// A memory the agent proposed during a session, held until the user reviews it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Candidate {
+    pub body: String,
+    /// fact, preference or project.
+    pub kind: String,
+    /// Notes it relates to (ids or titles): it links to those that exist when it's saved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<String>,
+}
+
+/// A change to memory that waits for the user's OK. Notes are named by id.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Proposal {
+    /// Save a candidate as a new note.
+    New(Candidate),
+    /// Fold note `remove` into note `keep`, whose text becomes `body`; links to `remove` move to `keep`.
+    Merge { keep: String, remove: String, body: String },
+    /// Add a link from note `from` to note `to`.
+    Link { from: String, to: String },
+    /// Note `note` links to `target`, which doesn't exist: point the link at note `to`, or (None)
+    /// turn it into plain text.
+    FixLink { note: String, target: String, to: Option<String> },
+}
+
+impl Proposal {
+    /// The part the user can edit: a note's text, or the note a link points to.
+    pub fn text(&self) -> String {
+        match self {
+            Proposal::New(c) => c.body.clone(),
+            Proposal::Merge { body, .. } => body.clone(),
+            Proposal::Link { to, .. } => to.clone(),
+            Proposal::FixLink { to, .. } => to.clone().unwrap_or_default(),
+        }
+    }
+
+    /// The proposal with its editable part replaced by `text` (an empty target removes a dead link).
+    pub fn with_text(&self, text: &str) -> Proposal {
+        let t = text.trim().to_string();
+        match self.clone() {
+            Proposal::New(c) => Proposal::New(Candidate { body: t, ..c }),
+            Proposal::Merge { keep, remove, .. } => Proposal::Merge { keep, remove, body: t },
+            Proposal::Link { from, .. } => Proposal::Link { from, to: t },
+            Proposal::FixLink { note, target, .. } => Proposal::FixLink { note, target, to: (!t.is_empty()).then_some(t) },
+        }
+    }
 }
 
 pub struct Memory {
@@ -122,11 +170,7 @@ impl Memory {
         let path = self.dir.join(format!("{id}.md"));
         let now = crate::agent::utc_iso(crate::agent::now());
         let created = read_note(&path).map(|n| n.created).filter(|c| !c.is_empty()).unwrap_or_else(|| now.clone());
-        // write it whole, then swap it in: a crash never leaves half a note
-        let tmp = self.dir.join(format!(".{id}.{}.md.tmp", std::process::id())); // two windows never share one
-        std::fs::write(&tmp, note_text(id, &new, &created, &now))
-            .and_then(|()| std::fs::rename(&tmp, &path))
-            .map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("couldn't write {}: {e}", path.display()) })?;
+        self.write_whole(&path, &note_text(id, &new, &created, &now))?;
         read_note(&path).ok_or_else(|| format!("couldn't read back {}", path.display()))
     }
 
@@ -148,6 +192,148 @@ impl Memory {
         }
         let _ = std::fs::remove_file(self.dir.join(".index.json"));
         Ok(files.len())
+    }
+
+    /// What could be tidied, for the user to review: dead links (each pointed at the closest note,
+    /// or made plain text when nothing is close), then notes so alike they should be one, then
+    /// notes alike enough to link. At most ten at a time, so a review stays short. Session notes
+    /// are summaries: they're never merged or linked, only their dead links fixed.
+    pub fn consolidation(&self) -> Vec<Proposal> {
+        const MAX: usize = 10;
+        const MERGE_AT: f64 = 0.6; // share of words in common
+        const LINK_AT: f64 = 0.25;
+        let all = self.notes();
+        let mut fixes = vec![];
+        for n in &all {
+            for target in wikilinks(&n.body).into_iter().filter(|t| lookup(&all, t).is_none()) {
+                let to = self.search(&target, 5).into_iter().map(|h| h.note).find(|h| h.id != n.id && h.kind != "session").map(|h| h.id);
+                fixes.push(Proposal::FixLink { note: n.id.clone(), target, to });
+            }
+        }
+        let words: Vec<(&Note, HashSet<String>)> = all.iter().filter(|n| n.kind != "session")
+            .map(|n| (n, tokens(&format!("{} {}", n.title, n.body)).into_iter().collect())).collect();
+        let (mut merges, mut links) = (vec![], vec![]);
+        for (i, (a, wa)) in words.iter().enumerate() {
+            for (b, wb) in &words[i + 1..] {
+                let union = wa.union(wb).count();
+                let similar = if union == 0 { 0.0 } else { wa.intersection(wb).count() as f64 / union as f64 };
+                if similar >= MERGE_AT { merges.push((similar, *a, *b)); }
+                else if similar >= LINK_AT && !linked(&all, a, b) { links.push((similar, *a, *b)); }
+            }
+        }
+        merges.sort_by(|x, y| y.0.total_cmp(&x.0));
+        links.sort_by(|x, y| y.0.total_cmp(&x.0));
+        let mut merged: Vec<&str> = vec![]; // a note goes into at most one merge per review
+        let mut merge_proposals = vec![];
+        for (_, a, b) in merges {
+            if merged.contains(&a.id.as_str()) || merged.contains(&b.id.as_str()) { continue; }
+            // keep the fuller note (or the older one), and add the lines only the other has
+            let (keep, remove) = if (b.body.len(), &a.created) > (a.body.len(), &b.created) { (b, a) } else { (a, b) };
+            let mut body = keep.body.clone();
+            for line in remove.body.lines().map(str::trim).filter(|l| !l.is_empty() && !keep.body.contains(l)) { body += &format!("\n{line}"); }
+            merged.extend([a.id.as_str(), b.id.as_str()]);
+            merge_proposals.push(Proposal::Merge { keep: keep.id.clone(), remove: remove.id.clone(), body });
+        }
+        // notes are newest first: the newer note links to the older one
+        let link_proposals = links.into_iter().map(|(_, a, b)| Proposal::Link { from: a.id.clone(), to: b.id.clone() });
+        // one of each kind in turn, so many dead links don't crowd out merges and links
+        let mut kinds = [fixes.into_iter(), merge_proposals.into_iter(), link_proposals.collect::<Vec<_>>().into_iter()];
+        let mut out = vec![];
+        loop {
+            let before = out.len();
+            for kind in kinds.iter_mut() {
+                if out.len() < MAX && let Some(p) = kind.next() { out.push(p); }
+            }
+            if out.len() == before { return out; }
+        }
+    }
+
+    /// Carry out an approved proposal; `source` (a session id) is recorded on a new note. Returns
+    /// the note that was created or changed (for a merge, the one kept).
+    pub fn apply(&self, p: &Proposal, source: Option<&str>) -> Result<Note, String> {
+        let all = self.notes();
+        let get = |key: &str| lookup(&all, key).cloned().ok_or_else(|| format!("no note called '{}'", key.trim()));
+        let reread = |id: &str| self.find(id).ok_or_else(|| format!("couldn't read back {id}"));
+        match p {
+            Proposal::New(c) => {
+                let mut seen = HashSet::new();
+                let ids: Vec<String> = c.related.iter().filter_map(|r| lookup(&all, r)).map(|n| n.id.clone()).filter(|id| seen.insert(id.clone())).collect();
+                let mut body = c.body.trim().to_string();
+                if !ids.is_empty() { body += &format!("\n\nRelated: {}", ids.iter().map(|i| format!("[[{i}]]")).collect::<Vec<_>>().join(" ")); }
+                match self.add(NewNote { title: short_title(&c.body), body, kind: c.kind.clone(), source: source.map(String::from) })? {
+                    Added::Created(n) | Added::Exists(n) => Ok(n),
+                }
+            }
+            Proposal::Merge { keep, remove, body } => {
+                let (keep, remove) = (get(keep)?, get(remove)?);
+                if keep.id == remove.id { return Err("a note can't be merged into itself".into()); }
+                if body.trim().is_empty() { return Err("a note needs some text".into()); }
+                self.rewrite(&keep, |_| body.trim().to_string())?;
+                // links to the removed note now point at the kept one
+                let all = self.notes();
+                for n in all.iter().filter(|n| n.id != remove.id) {
+                    // the kept note's own link to the other would point at itself: make it plain text
+                    let to = (n.id != keep.id).then_some(keep.id.as_str());
+                    self.rewrite_links(n, |t| lookup(&all, t).is_some_and(|r| r.id == remove.id), to)?;
+                }
+                std::fs::remove_file(&remove.path).map_err(|e| format!("couldn't delete {}: {e}", remove.path.display()))?;
+                reread(&keep.id)
+            }
+            Proposal::Link { from, to } => {
+                let (from, to) = (get(from)?, get(to)?);
+                if from.id == to.id { return Err("a note can't link to itself".into()); }
+                if !links_among(&all, &from).outgoing.iter().any(|l| l.note.as_ref().is_some_and(|n| n.id == to.id)) {
+                    self.rewrite(&from, |body| {
+                        let link = format!("[[{}]]", to.id);
+                        // add to a "See also:" line already there, or start one
+                        match body.lines().position(|l| l.starts_with("See also:")) {
+                            Some(i) => body.lines().enumerate().map(|(j, l)| if j == i { format!("{l} {link}") } else { l.to_string() }).collect::<Vec<_>>().join("\n"),
+                            None => format!("{body}\n\nSee also: {link}"),
+                        }
+                    })?;
+                }
+                reread(&from.id)
+            }
+            Proposal::FixLink { note, target, to } => {
+                let note = get(note)?;
+                let to = to.as_deref().map(get).transpose()?;
+                self.rewrite_links(&note, |t| t == target.trim(), to.as_ref().map(|n| n.id.as_str()))?;
+                reread(&note.id)
+            }
+        }
+    }
+
+    /// Replace a note's text with `f(text)`, keeping its frontmatter exactly as written (a note
+    /// written by hand may have fields Cortex doesn't know).
+    fn rewrite(&self, note: &Note, f: impl FnOnce(&str) -> String) -> Result<(), String> {
+        let raw = std::fs::read_to_string(&note.path).map_err(|e| format!("couldn't read {}: {e}", note.path.display()))?.replace("\r\n", "\n");
+        let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+        let (front, body) = split_frontmatter(raw);
+        let body = f(body.trim());
+        let text = if front.is_empty() { format!("{}\n", body.trim()) } else { format!("{front}\n{}\n", body.trim()) };
+        self.write_whole(&note.path, &text)
+    }
+
+    /// Point the links in `note` whose target `matches` at note `to`, or (None) make them plain text.
+    fn rewrite_links(&self, note: &Note, matches: impl Fn(&str) -> bool, to: Option<&str>) -> Result<(), String> {
+        if !wikilinks(&note.body).iter().any(|t| matches(t)) { return Ok(()); }
+        self.rewrite(note, |body| WIKILINK.replace_all(body, |c: &regex::Captures| {
+            let target = c[1].trim();
+            match (matches(target), to) {
+                (false, _) => c[0].to_string(),
+                (true, Some(id)) => format!("[[{id}]]"),
+                (true, None) => target.to_string(),
+            }
+        }).into_owned())
+    }
+
+    /// Write a file whole, then swap it in: a crash never leaves half a note.
+    fn write_whole(&self, path: &Path, text: &str) -> Result<(), String> {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("note.md");
+        let tmp = self.dir.join(format!(".{name}.{}.tmp", std::process::id())); // two windows never share one
+        std::fs::write(&tmp, text)
+            .and_then(|()| std::fs::rename(&tmp, path))
+            .map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("couldn't write {}: {e}", path.display()) })
     }
 
     /// The links in a note, resolved, and the notes that link to it.
@@ -383,6 +569,24 @@ pub fn short_title(fact: &str) -> String {
     title.trim_end_matches(['.', ',', ';', ':']).to_string()
 }
 
+/// Whether either note links to the other.
+fn linked(notes: &[Note], a: &Note, b: &Note) -> bool {
+    let to = |from: &Note, to: &Note| wikilinks(&from.body).iter().any(|t| lookup(notes, t).is_some_and(|n| n.id == to.id));
+    to(a, b) || to(b, a)
+}
+
+/// A note file's frontmatter (from the first `---` line through the next, newline included; empty
+/// if there's none) and the text after it.
+fn split_frontmatter(text: &str) -> (&str, &str) {
+    if !text.starts_with("---\n") { return ("", text); }
+    let mut at = 4;
+    for line in text[4..].split_inclusive('\n') {
+        at += line.len();
+        if line.trim_end() == "---" { return text.split_at(at); }
+    }
+    ("", text)
+}
+
 /// A note's links resolved among `notes`, and the notes there that link to it.
 fn links_among(notes: &[Note], note: &Note) -> Links {
     let resolve = |target: &str| lookup(notes, target).cloned();
@@ -414,6 +618,10 @@ pub fn render_with_links(n: &Note, links: &Links) -> String {
 }
 
 /// Text on one line, with runs of spaces and line breaks made single spaces.
+/// A note's text without the "Related:" links added when a suggested memory was saved: the fact
+/// as it was suggested.
+pub fn fact_of(body: &str) -> &str { body.split("\n\nRelated: ").next().unwrap_or(body).trim() }
+
 pub fn one_line(s: &str) -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") }
 
 /// The note with this id, or else this title (in any case).

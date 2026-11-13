@@ -27,7 +27,7 @@ pub struct Tool {
 /// Every built-in tool, built once at compile time.
 pub fn all() -> &'static [Tool] { &TOOLS }
 
-static TOOLS: [Tool; 11] = [
+static TOOLS: [Tool; 12] = [
         Tool { name: "read_file", group: "file", summary: "read a text file (with line numbers)", needs_approval: false, network: false,
             params: || json!({"type":"object","properties":{
                 "path":{"type":"string"},
@@ -66,6 +66,12 @@ static TOOLS: [Tool; 11] = [
                 "fact":{"type":"string","description":"one short durable fact about the user or project"},
                 "kind":{"type":"string","enum":["fact","preference","project"],"description":"what sort of fact it is (default fact)"}},
                 "required":["fact"]}) },
+        Tool { name: "suggest_memory", group: "memory", summary: "propose a fact to keep in long-term memory; the user reviews it later", needs_approval: false, network: false,
+            params: || json!({"type":"object","properties":{
+                "fact":{"type":"string","description":"one short durable fact about the user or project"},
+                "kind":{"type":"string","enum":["fact","preference","project"],"description":"what sort of fact it is (default fact)"},
+                "related":{"type":"array","items":{"type":"string"},"description":"titles of memory notes it relates to, if any"}},
+                "required":["fact"]}) },
 ];
 
 impl Tool {
@@ -97,7 +103,7 @@ pub fn describe(name: &str, a: &Value) -> String {
         "run_python" => format!("python ({} lines)", s("code").lines().count()),
         "calculator" => s("expression"),
         "fetch_url" => s("url"),
-        "remember" => s("fact"),
+        "remember" | "suggest_memory" => s("fact"),
         "recall" => s("query"),
         _ => a.to_string(),
     }
@@ -133,6 +139,8 @@ pub struct ToolContext<'a> {
     pub memory: &'a crate::memory::Memory,
     /// Collects the ids of the notes `recall` returns and `remember` saves, for the session's note.
     pub used: &'a std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Where `suggest_memory` puts what it proposes, until the user reviews it.
+    pub candidates: &'a std::cell::RefCell<Vec<crate::memory::Candidate>>,
 }
 
 /// Run a tool.
@@ -152,6 +160,7 @@ pub fn execute(name: &str, a: &Value, ctx: &ToolContext) -> String {
         "fetch_url" => Err("network access is off (Cortex is offline by default). Run `cortex config set allow_network true` to enable.".into()),
         "remember" => remember(a, ctx),
         "recall" => recall(a, ctx),
+        "suggest_memory" => suggest_memory(a, ctx),
         _ => Err(format!("unknown tool '{name}'")),
     };
     let out = match r { Ok(s) => s, Err(e) => format!("ERROR: {e}") };
@@ -427,12 +436,35 @@ fn recall(a: &Value, ctx: &ToolContext) -> Result<String, String> {
     Ok(notes.iter().map(|n| crate::memory::render_with_links(n, &ctx.memory.links(n))).collect::<Vec<_>>().join("\n"))
 }
 
+/// Propose a fact for long-term memory. Nothing is saved: the user reviews it at the end of the
+/// session (or on /consolidate). A fact memory has already, or one suggested already, isn't added.
+fn suggest_memory(a: &Value, ctx: &ToolContext) -> Result<String, String> {
+    let fact = crate::memory::one_line(arg(a, "fact")?);
+    if fact.is_empty() { return Err("the fact is empty".into()); }
+    let same = |body: &str| crate::memory::fact_of(body).eq_ignore_ascii_case(&fact);
+    if let Some(n) = ctx.memory.notes().into_iter().find(|n| same(&n.body)) {
+        return Ok(format!("already in memory as [[{}]]; nothing to suggest", n.id));
+    }
+    let mut pending = ctx.candidates.borrow_mut();
+    if pending.iter().any(|c| same(&c.body)) { return Ok("already suggested in this session".into()); }
+    let kind = memory_kind(a).to_string();
+    let related = a["related"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).map(crate::memory::one_line).filter(|r| !r.is_empty()).collect();
+    pending.push(crate::memory::Candidate { body: fact, kind, related });
+    Ok(SUGGESTED.into())
+}
+
+/// What `suggest_memory` answers when it holds a new suggestion (undoing the turn drops those).
+pub const SUGGESTED: &str = "suggested: the user will review it (nothing is saved yet)";
+
+/// The kind of memory a `remember` or `suggest_memory` call asks for: fact unless it says otherwise.
+fn memory_kind(a: &Value) -> &str { a["kind"].as_str().filter(|k| ["preference", "project"].contains(k)).unwrap_or("fact") }
+
 /// Save a fact as a memory note (see memory.rs), noting the session it came from.
 fn remember(a: &Value, ctx: &ToolContext) -> Result<String, String> {
     use crate::memory::{short_title, Added, NewNote};
     let session_id = ctx.session_id;
     let fact = crate::memory::one_line(arg(a, "fact")?);
-    let kind = a["kind"].as_str().filter(|k| ["preference", "project"].contains(k)).unwrap_or("fact");
+    let kind = memory_kind(a);
     let source = (!session_id.is_empty()).then(|| session_id.to_string());
     let (verb, n) = match ctx.memory.add(NewNote { title: short_title(&fact), body: fact, kind: kind.into(), source })? {
         Added::Created(n) => ("saved to memory as", n),

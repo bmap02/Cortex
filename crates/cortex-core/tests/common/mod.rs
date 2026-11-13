@@ -11,10 +11,12 @@ pub struct MockServer { child: Child, pub port: u16 }
 
 impl MockServer {
     pub fn start() -> MockServer {
-        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/mock_server.py");
+        // tests/ at the repo root, found from whichever package's tests use this
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().map(|d| d.join("tests/mock_server.py"))
+            .find(|p| p.exists()).expect("tests/mock_server.py in the repo");
         // python3 first; on Windows it can be a Store placeholder that prints nothing, so fall through
         for py in ["python3", "python"] {
-            let Ok(mut child) = Command::new(py).args(["-u", script, "0"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { continue };
+            let Ok(mut child) = Command::new(py).arg("-u").arg(&script).arg("0").stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { continue };
             let mut line = String::new();
             let _ = BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut line);
             match line.trim().strip_prefix("PORT ").and_then(|p| p.parse().ok()) {

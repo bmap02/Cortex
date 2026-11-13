@@ -23,6 +23,9 @@ pub struct Session {
     pub model: String,
     pub created: u64,
     pub messages: Vec<Msg>, // without the system prompt (rebuilt on load)
+    /// Memories the agent suggested that the user hasn't reviewed yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<memory::Candidate>,
 }
 
 pub fn now() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
@@ -139,6 +142,8 @@ pub struct Agent {
     used: RefCell<BTreeSet<String>>,
     /// The conversation has moved on since its session note was last written.
     note_due: bool,
+    /// Memories suggested in this session, waiting for the user's review.
+    candidates: RefCell<Vec<memory::Candidate>>,
 }
 
 /// What happens during a turn, in order. The last event is always [`Event::Done`] or [`Event::Error`].
@@ -158,6 +163,8 @@ pub enum Event {
     ToolSkipped { name: String, description: String },
     /// Notes from long-term memory sent with this message (their titles).
     Recalled { notes: Vec<String> },
+    /// The agent suggested a memory; it waits for the user's review (see [`Agent::to_review`]).
+    MemoryCandidate(memory::Candidate),
     /// A tool call needs the user's OK before it runs.
     ApprovalRequest(ApprovalRequest),
     /// The tool call that last started has finished with this result (what the model sees).
@@ -231,7 +238,7 @@ You can call tools to read and edit files, search code, run shell commands and P
 - Use tools when they help; answer directly when they don't.
 - Read a file before patching it, and keep edits minimal.
 - Use the calculator for any arithmetic you'd otherwise estimate.
-- Use `remember` only for durable facts the user would want kept (preferences, project facts), not chit-chat.
+- When you learn a durable fact the user would want kept (a preference, a project fact), propose it with `suggest_memory`: the user reviews suggestions later. Use `remember` only when the user asks you to save something now. Never either for chit-chat.
 - Be concise. Use Markdown code blocks for code.{net}",
         date = &new_session_id()[..8], os = std::env::consts::OS, cwd = cwd, shell = tools::shell_name(),
         net = if cfg.allow_network { "" } else { "\n- You are offline: there is no internet access." });
@@ -270,6 +277,7 @@ impl Agent {
             turn_memory_block: None,
             used: RefCell::default(),
             note_due: false,
+            candidates: RefCell::default(),
             backend,
             cfg,
         }
@@ -282,9 +290,11 @@ impl Agent {
         self.last = Usage::default();
         self.used.take();
         self.note_due = false;
+        self.candidates.take();
     }
 
     pub fn resume(&mut self, s: Session) {
+        self.candidates.replace(s.candidates);
         self.msgs = vec![Msg::new("system", system_prompt(&self.cfg, &self.memory))];
         self.msgs.extend(s.messages);
         self.session_id = s.id;
@@ -297,9 +307,15 @@ impl Agent {
 
     pub fn save(&self) {
         if self.msgs.len() <= 1 { return; }
-        let s = Session { id: self.session_id.clone(), model: self.model.clone(), created: self.created, messages: self.msgs[1..].to_vec() };
+        let s = Session { id: self.session_id.clone(), model: self.model.clone(), created: self.created, messages: self.msgs[1..].to_vec(),
+            candidates: self.candidates.borrow().clone() };
         let _ = std::fs::create_dir_all(config::sessions_dir());
-        let _ = std::fs::write(config::sessions_dir().join(format!("{}.json", s.id)), serde_json::to_string_pretty(&s).unwrap_or_default());
+        // written whole, then swapped in: a crash while saving never leaves half a session
+        let path = config::sessions_dir().join(format!("{}.json", s.id));
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, serde_json::to_string_pretty(&s).unwrap_or_default()).and_then(|()| std::fs::rename(&tmp, &path)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     /// The notes relevant to a new message, within the memory budget (the markers around them
@@ -461,6 +477,7 @@ impl Agent {
                 tool_calls_made += 1;
                 emit(Event::ToolStarted { name: call.name.clone(), description: description.clone() });
                 let tool = tools::find(&call.name);
+                let suggested = self.candidates.borrow().len();
                 let result = match &tool {
                     None => format!("ERROR: unknown tool '{}'", call.name),
                     Some(t) if !t.enabled(&self.cfg) => format!("ERROR: tool '{}' is disabled", call.name),
@@ -468,8 +485,9 @@ impl Agent {
                         declined = true;
                         "The user declined this action. Do not retry it or try a workaround; wait for their instructions.".to_string()
                     }
-                    Some(_) => tools::execute(&call.name, &call.args, &tools::ToolContext { cfg: &self.cfg, cancel: &self.cancel, session_id: &self.session_id, memory: &self.memory, used: &self.used }),
+                    Some(_) => tools::execute(&call.name, &call.args, &tools::ToolContext { cfg: &self.cfg, cancel: &self.cancel, session_id: &self.session_id, memory: &self.memory, used: &self.used, candidates: &self.candidates }),
                 };
+                if let Some(c) = self.candidates.borrow().get(suggested) { emit(Event::MemoryCandidate(c.clone())); }
                 emit(Event::ToolFinished { result: result.clone() });
                 self.msgs.push(Msg::tool_result(call, result));
             }
@@ -563,11 +581,50 @@ impl Agent {
         Ok(note)
     }
 
+    /// What waits for the user's review: the memories suggested in this session and, when
+    /// `consolidate`, ways to tidy the whole memory (see [`Memory::consolidation`]). Answer each with
+    /// [`Agent::accept`] or [`Agent::reject`]; whatever isn't answered stays for later.
+    pub fn to_review(&self, consolidate: bool) -> Vec<memory::Proposal> {
+        let mut items: Vec<memory::Proposal> = self.candidates.borrow().iter().cloned().map(memory::Proposal::New).collect();
+        if consolidate { items.extend(self.memory.consolidation()); }
+        items
+    }
+
+    /// Carry out a reviewed proposal, with its text replaced by `edit` if the user changed it.
+    /// A saved candidate is linked from this session's note. Returns the note created or changed.
+    pub fn accept(&mut self, p: &memory::Proposal, edit: Option<&str>) -> Result<memory::Note, String> {
+        let edited = edit.map(|t| p.with_text(t));
+        let note = self.memory.apply(edited.as_ref().unwrap_or(p), Some(&self.session_id))?;
+        if let memory::Proposal::New(_) = p { self.used.borrow_mut().insert(note.id.clone()); }
+        self.drop_candidate(p);
+        Ok(note)
+    }
+
+    /// Turn a proposal down: a suggested memory is dropped for good, a tidy-up just isn't done.
+    pub fn reject(&mut self, p: &memory::Proposal) { self.drop_candidate(p); }
+
+    fn drop_candidate(&mut self, p: &memory::Proposal) {
+        let memory::Proposal::New(c) = p else { return };
+        let before = self.candidates.borrow().len();
+        self.candidates.borrow_mut().retain(|x| x != c);
+        if self.candidates.borrow().len() != before { self.save(); } // the session file holds the rest
+    }
+
     /// Remove the last user turn and everything after it; returns that user text.
     pub fn undo(&mut self) -> Option<String> {
         let i = self.msgs.iter().rposition(|m| m.role == "user")?;
         if i == 0 { return None; }
         let text = self.msgs[i].content.clone();
+        // memories suggested in the removed turn go with it (results follow their calls in order)
+        let removed = &self.msgs[i..];
+        let mut undone = vec![];
+        for (k, m) in removed.iter().enumerate() {
+            for (j, c) in m.tool_calls.iter().enumerate() {
+                let held = removed.get(k + 1 + j).is_some_and(|r| r.role == "tool" && r.content == tools::SUGGESTED);
+                if c.name == "suggest_memory" && held && let Some(f) = c.args["fact"].as_str() { undone.push(memory::one_line(f)); }
+            }
+        }
+        if !undone.is_empty() { self.candidates.borrow_mut().retain(|c| !undone.iter().any(|f| f.eq_ignore_ascii_case(&c.body))); }
         self.msgs.truncate(i);
         Some(text)
     }
