@@ -107,3 +107,18 @@ fn clearing_sessions_says_memory_is_kept() {
     assert!(out.contains("deleted 1 session") && out.contains("memory notes are kept"), "{out}");
     let _ = std::fs::remove_dir_all(&h);
 }
+
+#[test]
+fn the_session_list_says_how_many_more_there_are_past_the_first_30() {
+    let h = home("many_sessions");
+    std::fs::create_dir_all(h.join("sessions")).unwrap();
+    for i in 0..32 {
+        let id = format!("20261113-0900{i:02}");
+        std::fs::write(h.join("sessions").join(format!("{id}.json")), format!(r#"{{"id":"{id}","model":"m","created":0,"messages":[]}}"#)).unwrap();
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_cortex")).args(["sessions", "list"]).env("CORTEX_HOME", &h).output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.matches(" msgs").count(), 30, "{out}");
+    assert!(out.contains("and 2 more"), "{out}");
+    let _ = std::fs::remove_dir_all(&h);
+}

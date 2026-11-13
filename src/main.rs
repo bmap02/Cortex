@@ -151,7 +151,9 @@ enum ModelsCmd {
 
 fn main() {
     let cli = Cli::parse();
-    let _ = ctrlc::set_handler(|| CTRL_C.cancel());
+    if let Err(e) = ctrlc::set_handler(|| CTRL_C.cancel()) {
+        eprintln!("{}", ui::faint(&format!("warning: Ctrl+C won't stop replies in this terminal ({e})")));
+    }
     let mut cfg = Config::load();
     if let Some(m) = &cli.model { cfg.model = m.clone(); }
     if let Some(n) = cli.ctx { cfg.num_ctx = n; }
@@ -521,7 +523,11 @@ fn run_once(cfg: Config, prompt: String, quiet: bool, no_tools: bool) -> i32 {
     let mut prompt = prompt;
     if !std::io::stdin().is_terminal() {
         let mut piped = String::new();
-        let _ = std::io::stdin().read_to_string(&mut piped);
+        // e.g. a file that isn't UTF-8 text: running on without it would answer a different question
+        if let Err(e) = std::io::stdin().read_to_string(&mut piped) {
+            eprintln!("{}", ui::error(&format!("couldn't read the piped input: {e}")));
+            return 1;
+        }
         if !piped.trim().is_empty() { prompt = format!("{prompt}\n\n```\n{}\n```", piped.trim_end()); }
     }
     if prompt.trim().is_empty() { eprintln!("usage: cortex run \"your prompt\""); return 2; }
@@ -760,6 +766,7 @@ fn print_sessions() {
     for (id, first, n) in s.iter().take(30) {
         println!("  {}  {}  {}", ui::bold(id), ui::truncate(first, 60), ui::faint(&format!("{n} msgs")));
     }
+    if s.len() > 30 { println!("  {}", ui::faint(&format!("… and {} more (oldest not shown)", s.len() - 30))); }
 }
 
 /// "owner/name" of the GitHub repo, from Cargo.toml's `repository`.

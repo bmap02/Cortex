@@ -137,7 +137,8 @@ else { Fail "Ollama is installed but its server isn't responding. Open the Ollam
 # ------------------------------------------------------------------ 5. Model
 Step 5 "Model"
 $installed = @()
-try { $installed = @((Invoke-RestMethod -Uri "$OllamaUrl/api/tags").models | ForEach-Object { $_.name }) } catch { }
+try { $installed = @((Invoke-RestMethod -Uri "$OllamaUrl/api/tags").models | ForEach-Object { $_.name }) }
+catch { Info "couldn't list the installed models ($($_.Exception.Message)); showing recommended ones" }
 
 if (-not $Model -and -not $SkipModel) {
     # Cortex's own recommendations (`cortex models recommend`), so the two never disagree. Point

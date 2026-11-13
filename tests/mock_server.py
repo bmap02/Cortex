@@ -1,18 +1,30 @@
-"""Fake Ollama + OpenAI-compatible server for end-to-end tests (no real model needed).
+"""Fake Ollama + OpenAI-compatible server for tests (no real model needed).
 
-Scripted behaviour: if the last message is from the user, ask for a tool call
-(calculator for math questions, write_file when asked to write a file); after a
-tool result comes back, stream a final answer that quotes the result. A prompt
-containing "loop" repeats the same calculator call until Cortex refuses to rerun it.
-"write to <path>" asks to write that file; "slow" streams a long answer slowly (for stopping).
-"I learned that <fact>[, related to <note>]" proposes a memory with suggest_memory.
-Asked to summarize the conversation (a request without tools), it lists the user's messages.
-/api/pull streams download progress and adds the model to /api/tags.
-For imports: /api/models/<repo>/tree/main lists a Hugging Face repo's files, /files/model.gguf is a
-GGUF to download (slowly, so it can be stopped), and /api/blobs + /api/create take an upload.
-/api/embed and /v1/embeddings embed text once an embedding model has been "pulled" (word counts
-with a few synonyms, so "feline" means "cat"); /debug/embedded says how many texts were embedded.
-Port 0 picks a free port and prints "PORT <n>" first, for tests that run several servers at once.
+Usage: python mock_server.py [port]. The default port is 11999 (the CI end-to-end check); port 0
+picks a free one and prints "PORT <n>" first, for tests that run several servers at once.
+
+Chat (/api/chat, /v1/chat/completions) is scripted by the user's latest message:
+  digits ("what is 2+2?")         calls the calculator, then quotes its result
+  "loop"                          repeats the same calculator call until Cortex refuses to rerun it
+  "write" / "write to <path>"     asks to write a file (out/hello.txt by default)
+  "recall <query>"                calls the recall tool
+  "remember that <fact>"          calls remember
+  "I learned that <fact>[, related to <note>]"   calls suggest_memory
+  "slow"                          streams a long answer slowly (for stopping it)
+  "long" / "huge"                 wrapping lines with wide characters / 80 lines, for checking the
+                                  terminal display by hand (no test uses them)
+  anything else                   "Hi! I'm a mock model running locally."
+A request without tools gets plain text: "Plain chat answer without tools.", or, when it asks for
+a summary, the user's messages listed (slowly if one says "lengthy", for stopping a summary).
+The model "notools" refuses tools the way Ollama does, for the plain-chat fallback.
+
+Models: /api/tags and /v1/models list mock:7b plus anything pulled or created; /api/show reports a
+32k context. /api/pull streams download progress and adds the model.
+Imports: /api/models/<repo>/tree/main lists a Hugging Face repo's files, /files/model.gguf is a GGUF
+to download (slowly, so it can be stopped), and /api/blobs + /api/create take an upload.
+Embeddings: /api/embed and /v1/embeddings work once an embedding model has been pulled (word counts
+with a few synonyms, so "feline" means "cat").
+For tests: /debug/last-request is the last chat request; /debug/embedded counts texts embedded.
 """
 import hashlib, json, re, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

@@ -57,6 +57,7 @@
 
         # Check the download against the release's SHA256SUMS.txt
         $Expected = $null
+        $Why = "it doesn't list $File"
         try {
             $Sums = Join-Path $Tmp 'SHA256SUMS.txt'
             Invoke-WebRequest -Uri "$Rel/SHA256SUMS.txt" -OutFile $Sums -UseBasicParsing
@@ -64,10 +65,10 @@
                 $parts = $line.Trim() -split '\s+', 2
                 if ($parts.Count -eq 2 -and $parts[1].TrimStart('*') -eq $File) { $Expected = $parts[0].ToLower() }
             }
-        } catch { }
+        } catch { $Why = $_.Exception.Message }
         # every release publishes one: without it the download can't be told apart from a swapped one
         if (-not $Expected) {
-            Write-Host "Couldn't get the checksum for $File (SHA256SUMS.txt), so the download can't be verified." -ForegroundColor Red
+            Write-Host "Couldn't get the checksum for $File (SHA256SUMS.txt: $Why), so the download can't be verified." -ForegroundColor Red
             throw "Cortex was not installed; try again later."
         } else {
             $Actual = (Get-FileHash -Algorithm SHA256 -Path $Zip).Hash.ToLower()

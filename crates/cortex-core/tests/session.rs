@@ -631,3 +631,19 @@ fn a_server_that_was_down_when_first_asked_is_asked_again() {
     server.install("nomic-embed-text");
     assert_eq!(backend.model().as_deref(), Some("nomic-embed-text"), "not remembered as \"no model\"");
 }
+
+#[test]
+fn a_model_without_tool_support_falls_back_to_plain_chat_once() {
+    let server = MockServer::start();
+    let mut agent = agent(&server);
+    agent.model = "notools".into(); // the fake server refuses tools for this model, as Ollama does for some
+    let mut fallbacks = 0;
+    let answer = agent.send("what is 2+2?", |e| if let Event::PlainChatFallback(_) = e { fallbacks += 1 }).unwrap();
+    assert_eq!(fallbacks, 1, "the front-end is told once");
+    assert_eq!(answer.trim(), "Plain chat answer without tools.", "and the model still answers");
+    let mut again = 0;
+    agent.send("and 3+3?", |e| if let Event::PlainChatFallback(_) = e { again += 1 }).unwrap();
+    assert_eq!(again, 0, "later turns go straight to plain chat");
+    let req: serde_json::Value = ureq::get(&format!("{}/debug/last-request", server.url())).call().unwrap().into_json().unwrap();
+    assert!(req.get("tools").is_none_or(|t| t.as_array().is_some_and(|a| a.is_empty())), "no tools are offered any more: {req}");
+}
