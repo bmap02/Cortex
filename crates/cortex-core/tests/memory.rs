@@ -202,3 +202,10 @@ fn clearing_memory_deletes_the_notes_and_nothing_else() {
     assert!(mem.search("fact", 5).is_empty());
     assert!(h.join("memory").join("keep.txt").exists(), "only notes (and the index) are removed");
 }
+
+#[test]
+fn apostrophes_dont_split_words_in_ids() {
+    let mem = Memory::open(&home("apostrophe"));
+    assert_eq!(added(mem.add(note("User's name is Ben", "The user's name is Ben.")).unwrap()).id, "users-name-is-ben");
+    assert_eq!(added(mem.add(note("Don’t use tabs", "Prefers spaces.")).unwrap()).id, "dont-use-tabs", "curly apostrophes too");
+}

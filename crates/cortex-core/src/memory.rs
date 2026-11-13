@@ -328,6 +328,7 @@ fn tokens(text: &str) -> Vec<String> {
 fn slug(title: &str) -> String {
     let mut s = String::new();
     for c in title.to_lowercase().chars() {
+        if c == '\'' || c == '’' { continue; } // "user's" → "users", not "user-s"
         if c.is_alphanumeric() { s.push(c); } else if !s.ends_with('-') && !s.is_empty() { s.push('-'); }
         if s.chars().count() >= 60 { break; }
     }
