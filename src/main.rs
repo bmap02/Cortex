@@ -1,6 +1,7 @@
 //! Cortex: a lightweight, fully local AI agent for the terminal.
 
 mod markdown;
+mod memory_cmd;
 mod models;
 mod self_update;
 mod turn;
@@ -79,6 +80,13 @@ enum Cmd {
         action: Option<String>,
         key: Option<String>,
         value: Option<String>,
+    },
+    /// Long-term memory: `cortex memory list`, `show <note>`, `search <words>`, `links <note>`, `path`
+    Memory {
+        /// list | show | search | links | path
+        action: Option<String>,
+        /// A note's id or title, or the words to search for
+        args: Vec<String>,
     },
     /// List saved sessions, or remove them: `cortex sessions clear`, `cortex sessions delete <id>`
     Sessions {
@@ -166,6 +174,7 @@ fn main() {
         },
         Cmd::Tools { action, name } => tools_cmd(&cfg, action, name),
         Cmd::Config { action, key, value } => config_cmd(action, key, value),
+        Cmd::Memory { action, args } => memory_cmd::run(action.as_deref().unwrap_or("list"), &args),
         Cmd::Sessions { action, id, yes } => sessions_cmd(action.as_deref().unwrap_or("list"), id.as_deref().unwrap_or(""), yes),
         Cmd::Doctor => doctor(&cfg),
         Cmd::Update => update(),
@@ -187,8 +196,8 @@ const SLASH: &[(&str, &str)] = &[
     ("/compress", "summarize the conversation to free context"),
     ("/usage", "token usage this session"),
     ("/context", "show or set the context window: /context 32k"),
-    ("/memory", "show long-term memory (~/.cortex/MEMORY.md)"),
-    ("/forget", "clear long-term memory"),
+    ("/memory", "list long-term memory (notes in ~/.cortex/memory)"),
+    ("/forget", "delete all long-term memory"),
     ("/sessions", "list saved sessions · /sessions clear · /sessions delete <id>"),
     ("/resume", "load a session: /resume last, or /resume <id>"),
     ("/yolo", "toggle auto-approve for shell commands and file writes"),
@@ -247,7 +256,7 @@ fn banner_info(agent: &Agent) -> ui::BannerInfo {
     sections.push(ui::Section { title: "Tools".into(), rows: groups.into_iter().map(|(g, v)| (g, v.join(", "))).collect() });
 
     let ntools = enabled.len();
-    let mem = std::fs::read_to_string(config::memory_path()).map(|s| s.lines().filter(|l| l.starts_with("- ")).count()).unwrap_or(0);
+    let mem = cortex_core::memory::Memory::open(&config::home()).notes().len();
     ui::BannerInfo {
         version: env!("CARGO_PKG_VERSION").into(),
         model: if agent.model.is_empty() { "no model selected".into() } else { agent.model.clone() },
@@ -437,11 +446,22 @@ fn slash(agent: &mut Agent, line: &str) -> bool {
         "/usage" => println!("  {}\n  {}",
             ui::muted(&format!("this session: {} prompt + {} completion tokens", agent.total_prompt, agent.total_completion)),
             ui::muted(&format!("context: ~{} / {} tokens · {} messages", agent.ctx_used(), agent.cfg.num_ctx, agent.msgs.len()))),
-        "/memory" => match std::fs::read_to_string(config::memory_path()) {
-            Ok(m) if !m.trim().is_empty() => println!("{}", m.trim_end()),
-            _ => println!("{}", ui::muted("memory is empty. Ask Cortex to remember something.")),
-        },
-        "/forget" => { let _ = std::fs::remove_file(config::memory_path()); agent.msgs[0].content = agent::system_prompt(&agent.cfg); println!("{}", ui::muted("memory cleared")); }
+        "/memory" => memory_cmd::list(&cortex_core::memory::Memory::open(&config::home())),
+        "/forget" => {
+            let mem = cortex_core::memory::Memory::open(&config::home());
+            let n = mem.notes().len();
+            if n == 0 { println!("{}", ui::muted("memory is already empty")); return true; }
+            // one notes folder now, not one file: ask, since this can't be undone
+            if !ask(&format!("delete all {}? [y/N]", ui::plural(n, "memory note")), "").eq_ignore_ascii_case("y") {
+                println!("{}", ui::muted("kept them"));
+                return true;
+            }
+            match std::fs::remove_dir_all(mem.dir()) {
+                Ok(()) => println!("{}", ui::muted("memory cleared")),
+                Err(e) => println!("{}", ui::error(&format!("couldn't delete {}: {e}", mem.dir().display()))),
+            }
+            agent.msgs[0].content = agent::system_prompt(&agent.cfg);
+        }
         "/sessions" => {
             let (action, id) = arg.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((arg, ""));
             let action = if action.is_empty() { "list" } else { action };

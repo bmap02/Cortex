@@ -27,6 +27,9 @@ def decide(messages):
         return ("text", para * 2 + "\n\nWide characters: 日本語テキスト and emoji 🚀🔥 count as two columns.\n" + "\n".join(f"- item {i}" for i in range(8)))
     if "huge" in text:
         return ("text", "\n".join(f"line {i}" for i in range(80)))
+    if "remember that " in text:
+        at = text.index("remember that ") + len("remember that ")  # same offset in the original text
+        return ("tool", "remember", {"fact": last["content"][at:].strip()})
     if "slow" in text:
         return ("text", " ".join(f"word{i}" for i in range(200)))
     if "write" in text:

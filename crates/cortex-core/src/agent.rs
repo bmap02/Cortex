@@ -41,9 +41,17 @@ fn fresh_session_id() -> String {
 }
 
 /// `base`, or `base-2`, `base-3`, ... whichever isn't taken.
-fn first_free(base: &str, taken: impl Fn(&str) -> bool) -> String {
+pub(crate) fn first_free(base: &str, taken: impl Fn(&str) -> bool) -> String {
     if !taken(base) { return base.to_string(); }
     (2..).map(|n| format!("{base}-{n}")).find(|id| !taken(id)).expect("some suffix is free")
+}
+
+/// A UTC time as 2026-11-12T15:30:00Z.
+pub fn utc_iso(unix_secs: u64) -> String {
+    let t = unix_secs as i64;
+    let (days, secs) = (t.div_euclid(86400), t.rem_euclid(86400));
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -217,8 +225,12 @@ You can call tools to read and edit files, search code, run shell commands and P
     if !folders.is_empty() { s += &format!("\nUser folders: {}.", folders.join(", ")); }
     if let Ok(soul) = std::fs::read_to_string(config::soul_path())
         && !soul.trim().is_empty() { s += &format!("\n\n# Persona\n{}", soul.trim()); }
-    if let Ok(mem) = std::fs::read_to_string(config::memory_path())
-        && !mem.trim().is_empty() { s += &format!("\n\n# What you remember about the user\n{}", mem.trim()); }
+    // every note, until recall brings in just the relevant ones (ticket 08)
+    let notes = crate::memory::Memory::open(&config::home()).notes();
+    if !notes.is_empty() {
+        let lines: Vec<String> = notes.iter().map(|n| format!("- {}", crate::memory::one_line(&n.body))).collect();
+        s += &format!("\n\n# What you remember about the user\n{}", lines.join("\n"));
+    }
     s
 }
 
@@ -394,7 +406,7 @@ impl Agent {
                         declined = true;
                         "The user declined this action. Do not retry it or try a workaround; wait for their instructions.".to_string()
                     }
-                    Some(_) => tools::execute(&call.name, &call.args, &self.cfg, &self.cancel),
+                    Some(_) => tools::execute(&call.name, &call.args, &tools::ToolContext { cfg: &self.cfg, cancel: &self.cancel, session_id: &self.session_id }),
                 };
                 emit(Event::ToolFinished { result: result.clone() });
                 self.msgs.push(Msg::tool_result(call, result));

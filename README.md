@@ -264,6 +264,7 @@ cortex models pull qwen2.5:7b   # download any Ollama model by name
 cortex models import hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M   # a GGUF from Hugging Face
 cortex models import https://example.com/model.gguf --name my-model    # or from any URL
 cortex model qwen2.5:7b         # set the default model
+cortex memory list              # long-term memory notes; also: show <note>, search <words>, links <note>
 cortex tools                    # list tools; cortex tools disable run_shell
 cortex tools enable fetch_url   # let the agent read web pages (turns on network access)
 cortex config                   # show settings; cortex config set num_ctx 16384
@@ -298,7 +299,7 @@ into system RAM, so step back down. With an OpenAI-compatible server, the server
 | `/compress` | summarize the conversation to free context |
 | `/usage` | token counts and context fill |
 | `/context [size]` | show or change the context window, e.g. `/context 32k` (saved as default) |
-| `/memory` `/forget` | show / clear long-term memory |
+| `/memory` `/forget` | list / delete long-term memory |
 | `/sessions` `/resume <id>` | saved conversations; `/resume last` picks up the previous one |
 | `/sessions clear` `/sessions delete <id>` | remove all / one saved session |
 | `/yolo` | toggle auto-approve |
@@ -314,7 +315,7 @@ Everything lives in `~/.cortex/` (`%USERPROFILE%\.cortex\` on Windows; override 
 | | |
 |---|---|
 | `config.toml` | settings (see below) |
-| `MEMORY.md` | facts the agent saved with `remember`; edit freely |
+| `memory/` | long-term memory: one Markdown note per fact, with `[[links]]` between notes; edit freely (an older `MEMORY.md` is converted to notes and kept as `MEMORY.md.bak`) |
 | `SOUL.md` | optional persona or extra instructions added to every chat |
 | `sessions/` | saved conversations (JSON) |
 | `history.txt` | your input history |
@@ -351,6 +352,7 @@ crates/cortex-core/src/calc.rs      calculator
 crates/cortex-core/src/hardware.rs  RAM, GPUs and their VRAM, unified memory, OS and CPU of this machine
 crates/cortex-core/src/recommend.rs which catalog models suit the hardware (a pure function)
 crates/cortex-core/src/import.rs    importing GGUFs from Hugging Face or a URL into Ollama
+crates/cortex-core/src/memory.rs    long-term memory: Markdown notes, wikilinks, BM25 search
 crates/cortex-core/catalog.toml     the curated model catalog bundled into the binary
 crates/cortex-core/tests/session.rs drives agent turns against the fake model server
 tests/mock_server.py   fake Ollama/OpenAI server for testing without a model

@@ -9,5 +9,6 @@ pub mod cancel;
 pub mod config;
 pub mod hardware;
 pub mod import;
+pub mod memory;
 pub mod recommend;
 pub mod tools;

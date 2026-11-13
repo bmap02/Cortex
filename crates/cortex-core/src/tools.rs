@@ -59,7 +59,10 @@ static TOOLS: [Tool; 10] = [
         Tool { name: "fetch_url", group: "web", summary: "fetch a web page as text", needs_approval: false, network: true,
             params: || json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}) },
         Tool { name: "remember", group: "memory", summary: "save a fact to long-term memory", needs_approval: true, network: false,
-            params: || json!({"type":"object","properties":{"fact":{"type":"string","description":"one short durable fact about the user or project"}},"required":["fact"]}) },
+            params: || json!({"type":"object","properties":{
+                "fact":{"type":"string","description":"one short durable fact about the user or project"},
+                "kind":{"type":"string","enum":["fact","preference","project"],"description":"what sort of fact it is (default fact)"}},
+                "required":["fact"]}) },
 ];
 
 impl Tool {
@@ -113,8 +116,18 @@ pub fn preview(name: &str, a: &Value) -> Option<String> {
     }
 }
 
-/// Run a tool. `cancel` kills a shell command or Python script that is still running.
-pub fn execute(name: &str, a: &Value, cfg: &Config, cancel: &CancelHandle) -> String {
+/// What a tool may need from the session running it.
+pub struct ToolContext<'a> {
+    pub cfg: &'a Config,
+    /// Kills a shell command or Python script that is still running.
+    pub cancel: &'a CancelHandle,
+    /// Recorded as the source of what `remember` saves.
+    pub session_id: &'a str,
+}
+
+/// Run a tool.
+pub fn execute(name: &str, a: &Value, ctx: &ToolContext) -> String {
+    let (cfg, cancel) = (ctx.cfg, ctx.cancel);
     let r = match name {
         "read_file" => read_file(a),
         "write_file" => write_file(a),
@@ -127,7 +140,7 @@ pub fn execute(name: &str, a: &Value, cfg: &Config, cancel: &CancelHandle) -> St
             .map(|v| if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", v as i64) } else { format!("{v}") }),
         "fetch_url" if cfg.allow_network => fetch_url(a),
         "fetch_url" => Err("network access is off (Cortex is offline by default). Run `cortex config set allow_network true` to enable.".into()),
-        "remember" => remember(a),
+        "remember" => remember(a, ctx.session_id),
         _ => Err(format!("unknown tool '{name}'")),
     };
     let out = match r { Ok(s) => s, Err(e) => format!("ERROR: {e}") };
@@ -373,15 +386,16 @@ fn html_to_text(html: &str) -> String {
     BLANK_LINES.replace_all(&t, "\n\n").trim().to_string()
 }
 
-fn remember(a: &Value) -> Result<String, String> {
-    let fact = arg(a, "fact")?.trim().replace('\n', " ");
-    std::fs::create_dir_all(config::home()).map_err(|e| e.to_string())?;
-    let mut text = std::fs::read_to_string(config::memory_path()).unwrap_or_default();
-    if text.lines().any(|l| l.trim_start_matches("- ").eq_ignore_ascii_case(&fact)) { return Ok("already remembered".into()); }
-    if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
-    text += &format!("- {fact}\n");
-    std::fs::write(config::memory_path(), text).map_err(|e| e.to_string())?;
-    Ok("saved to memory".into())
+/// Save a fact as a memory note (see memory.rs), noting the session it came from.
+fn remember(a: &Value, session_id: &str) -> Result<String, String> {
+    use crate::memory::{short_title, Added, Memory, NewNote};
+    let fact = crate::memory::one_line(arg(a, "fact")?);
+    let kind = a["kind"].as_str().filter(|k| ["preference", "project"].contains(k)).unwrap_or("fact");
+    let source = (!session_id.is_empty()).then(|| session_id.to_string());
+    match Memory::open(&config::home()).add(NewNote { title: short_title(&fact), body: fact, kind: kind.into(), source })? {
+        Added::Created(n) => Ok(format!("saved to memory as [[{}]]", n.id)),
+        Added::Exists(n) => Ok(format!("already remembered in [[{}]]", n.id)),
+    }
 }
 
 #[cfg(test)]

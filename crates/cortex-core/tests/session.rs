@@ -166,3 +166,22 @@ fn a_nearly_full_context_is_compressed_before_the_next_reply() {
     assert_eq!(answer.trim(), "Hi! I'm a mock model running locally.", "and still answers the new message");
     assert!(agent.ctx_estimate() < 512, "the earlier conversation was replaced by a summary");
 }
+
+#[test]
+fn remember_saves_a_note_with_its_session_and_new_sessions_know_it() {
+    let server = MockServer::start();
+    let mut agent = agent(&server);
+    let (result, trace) = run_turn(&mut agent, "please remember that the user's cat is called Biscuit", Approval::AllowOnce);
+    assert!(result.is_ok());
+    assert!(trace.contains(&"approval remember".to_string()), "remembering still asks first: {trace:?}");
+
+    let home = std::path::PathBuf::from(std::env::var("CORTEX_HOME").unwrap());
+    let mem = cortex_core::memory::Memory::open(&home);
+    let note = mem.notes().into_iter().find(|n| n.body.contains("Biscuit")).expect("a note on disk");
+    assert_eq!(note.source.as_deref(), Some(agent.session_id.as_str()));
+    let text = std::fs::read_to_string(&note.path).unwrap();
+    assert!(text.starts_with("---\n") && text.contains("kind: fact"), "{text}");
+    // until recall arrives (ticket 08), every session's prompt still carries the memories
+    let fresh = Agent::new(Config::default());
+    assert!(fresh.msgs[0].content.contains("the user's cat is called Biscuit"), "{}", fresh.msgs[0].content);
+}
